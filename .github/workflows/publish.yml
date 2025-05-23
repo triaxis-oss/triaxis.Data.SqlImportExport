@@ -1,0 +1,29 @@
+name: publish nuget
+on:
+  push:
+    branches:
+      - main # Default release branch
+
+defaults:
+  run:
+    working-directory: src
+
+jobs:
+  publish:
+    name: Publish nuget
+    runs-on: ubuntu-latest
+    env:
+      DOTNET_NOLOGO: true
+      DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: true
+
+    steps:
+      - uses: actions/checkout@v4
+      - run: dotnet restore
+      - run: dotnet build --no-restore -c Release -p ContinuousIntegrationBuild=true
+      - run: dotnet pack --no-build -c Release -o ../pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: pack/*nupkg
+      - run: dotnet nuget push *.nupkg -s nuget.org -k ${{secrets.NUGET_API_KEY}} --skip-duplicate
+        working-directory: pack

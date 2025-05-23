@@ -1,0 +1,29 @@
+<Project>
+  <PropertyGroup>
+    <Authors>ssimek</Authors>
+    <Company>triaxis s.r.o.</Company>
+    <Description>Bulk import and export helpers for SQL Server</Description>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <PackageVersion>0.1.0</PackageVersion>
+    <PackageLicenseFile>LICENSE.txt</PackageLicenseFile>
+    <PackageIcon>icon.png</PackageIcon>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <SignAssembly>true</SignAssembly>
+    <AssemblyOriginatorKeyFile>$(MSBuildThisFileDirectory)triaxis-oss.snk</AssemblyOriginatorKeyFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../../LICENSE.txt" Pack="true" PackagePath="$(PackageLicenseFile)" />
+    <None Include="$(BaseIntermediateOutputPath)/icon.png" Pack="true" PackagePath="$(PackageIcon)" />
+  </ItemGroup>
+
+  <Target Name="DownloadPackageIcon" BeforeTargets="GenerateNuspec">
+    <DownloadFile SourceUrl="https://raw.githubusercontent.com/triaxis-oss/content/main/icon.png" DestinationFolder="$(BaseIntermediateOutputPath)" />
+  </Target>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="all" />
+  </ItemGroup>
+</Project>
