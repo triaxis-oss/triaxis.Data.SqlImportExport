@@ -105,13 +105,13 @@ public class BulkExportService(
         }
     }
 
-    class Table(SqlDataReader reader, string table, IReadOnlyCollection<IBulkExportColumn> columns) : IBulkExportTable
+    class Table(SqlDataReader reader, string table, IReadOnlyList<IBulkExportColumn> columns) : IBulkExportTable
     {
         private bool _done;
 
         public string Name => table;
 
-        public IReadOnlyCollection<IBulkExportColumn> Columns => columns;
+        public IReadOnlyList<IBulkExportColumn> Columns => columns;
 
         public async IAsyncEnumerable<IEnumerable<object?>> GetRowsAsync()
         {

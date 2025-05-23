@@ -8,4 +8,6 @@ public class BulkImportOptions
     public TimeSpan? Timeout { get; init; }
     public int? BatchSize { get; init; }
     public bool Truncate { get; init; }
+    public bool SkipIdentity { get; init; }
+    public bool KeepNulls { get; init; }
 }

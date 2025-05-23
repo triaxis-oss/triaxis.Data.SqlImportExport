@@ -30,8 +30,19 @@ public class BulkImportService(
 
         await using var transaction = await sqlConnection.BeginTransactionAsync();
 
+        SqlBulkCopyOptions bcpOptions = default;
+
+        if (!(options?.SkipIdentity == true))
+        {
+            bcpOptions |= SqlBulkCopyOptions.KeepIdentity;
+        }
+        if (options?.KeepNulls == true)
+        {
+            bcpOptions |= SqlBulkCopyOptions.KeepNulls;
+        }
+
         using var bcp = new SqlBulkCopy(sqlConnection,
-            SqlBulkCopyOptions.KeepIdentity | SqlBulkCopyOptions.KeepNulls, (SqlTransaction)transaction)
+            SqlBulkCopyOptions.KeepIdentity, (SqlTransaction)transaction)
         {
             BulkCopyTimeout = (int)(options?.Timeout ?? BulkImportOptions.DefaultTimeout).TotalSeconds,
             EnableStreaming = true,
