@@ -76,7 +76,27 @@ public class BulkImportService(
             await bcp.WriteToServerAsync(dataSource);
         }
 
-        await transaction.CommitAsync();
+        if (!(options?.SkipConstraints == true))
+        {
+            var tables = await sqlConnection.QueryAsync<string>("SELECT DISTINCT OBJECT_NAME(parent_object_id) FROM sys.foreign_keys WHERE is_not_trusted = 1");
+            int verifyCnt = tables.Count();
+            if (verifyCnt > 0)
+            {
+                logger.LogDebug("Verifying constraits in {Count} tables", verifyCnt);
+                var sql = string.Join(";\n",
+                    tables.Select(tbl => $"ALTER TABLE [{tbl}] WITH CHECK CHECK CONSTRAINT ALL"));
+                await sqlConnection.ExecuteAsync(sql);
+            }
+            else
+            {
+                logger.LogDebug("No constraints to verify");
+            }
+        }
+
+        if (!(options?.DryRun == true))
+            {
+                await transaction.CommitAsync();
+            }
     }
 
     private class DataReader : IDataReader

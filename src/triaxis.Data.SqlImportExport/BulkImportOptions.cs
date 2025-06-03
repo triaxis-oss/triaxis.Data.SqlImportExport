@@ -10,4 +10,6 @@ public class BulkImportOptions
     public bool Truncate { get; init; }
     public bool SkipIdentity { get; init; }
     public bool KeepNulls { get; init; }
+    public bool DryRun { get; init; }
+    public bool SkipConstraints { get; init; }
 }
