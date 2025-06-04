@@ -4,5 +4,5 @@ public interface IBulkExportTable
 {
     string Name { get; }
     IReadOnlyList<IBulkExportColumn> Columns { get; }
-    IAsyncEnumerable<IEnumerable<object?>> GetRowsAsync();
+    IAsyncEnumerable<IReadOnlyList<object?>> GetRowsAsync();
 }

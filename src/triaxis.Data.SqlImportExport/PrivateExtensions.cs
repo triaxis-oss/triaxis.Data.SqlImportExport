@@ -1,3 +1,5 @@
+using System.Data.Common;
+
 namespace triaxis.Data.SqlImportExport;
 
 internal static class PrivateExtensions
@@ -6,11 +8,15 @@ internal static class PrivateExtensions
     /// <summary>
     /// Quick and dirty single-column or tuple-mapping query
     /// </summary>
-    public static async Task<IEnumerable<T>> QueryAsync<T>(this SqlConnection sqlConnection, string query)
+    public static async Task<IEnumerable<T>> QueryAsync<T>(this SqlConnection sqlConnection, string query, DbTransaction? transaction = null)
     {
         await using var cmd = sqlConnection.CreateCommand();
         var result = new List<T>();
         cmd.CommandText = query;
+        if (transaction is SqlTransaction sqlTransaction)
+        {
+            cmd.Transaction = sqlTransaction;
+        }
 
         using var reader = await cmd.ExecuteReaderAsync();
         var values = new object?[reader.FieldCount];
@@ -36,10 +42,14 @@ internal static class PrivateExtensions
         return result;
     }
 
-    public static async Task<int> ExecuteAsync(this SqlConnection sqlConnection, string command)
+    public static async Task<int> ExecuteAsync(this SqlConnection sqlConnection, string command, DbTransaction? transaction = null)
     {
         await using var cmd = sqlConnection.CreateCommand();
         cmd.CommandText = command;
+        if (transaction is SqlTransaction sqlTransaction)
+        {
+            cmd.Transaction = sqlTransaction;
+        }
         return await cmd.ExecuteNonQueryAsync();
     }
 }

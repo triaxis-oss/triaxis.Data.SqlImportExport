@@ -113,7 +113,7 @@ public class BulkExportService(
 
         public IReadOnlyList<IBulkExportColumn> Columns => columns;
 
-        public async IAsyncEnumerable<IEnumerable<object?>> GetRowsAsync()
+        public async IAsyncEnumerable<IReadOnlyList<object?>> GetRowsAsync()
         {
             while (!_done)
             {
