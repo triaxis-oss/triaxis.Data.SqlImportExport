@@ -42,20 +42,20 @@ public class BulkExportService(
 
         logger.LogDebug("Going to export data for {TableCount} tables", tableNames.Count);
 
-        var tableColumns = (await sqlConnection.QueryAsync<(string table, string name, string type, string def)>("""
-            SELECT t.name, c.name, type.name, OBJECT_DEFINITION(c.default_object_id)
+        var tableColumns = (await sqlConnection.QueryAsync<(string table, string name, bool pk, string type, string def)>("""
+            SELECT t.name, c.name, CAST(IIF(ix.pk_ordinal IS NULL, 0, 1) AS BIT), type.name, OBJECT_DEFINITION(c.default_object_id)
             FROM sys.columns c
             INNER JOIN sys.tables t ON t.object_id = c.object_id
             INNER JOIN sys.types type ON type.user_type_id = c.user_type_id
             OUTER APPLY (
-                SELECT TOP 1 1 is_pk
+                SELECT ic.key_ordinal pk_ordinal
                 FROM sys.index_columns ic
                 INNER JOIN sys.indexes ix ON ix.object_id = ic.object_id AND ix.index_id = ic.index_id
                 WHERE ix.is_primary_key = 1 AND ic.object_id = c.object_id AND ic.column_id = c.column_id
             ) ix
-            ORDER BY t.name, c.object_id, IIF(ix.is_pk = 1, 0, 1), c.column_id
+            ORDER BY t.name, c.object_id, IIF(ix.pk_ordinal IS NULL, 1, 0), ix.pk_ordinal, c.column_id
             """))
-            .ToLookup(r => r.table, r => (r.name, def: ParseDefault(r.type, r.def)));
+            .ToLookup(r => r.table, r => (r.name, r.pk, def: ParseDefault(r.type, r.def)));
 
         var queryAll = new StringBuilder();
 
@@ -80,7 +80,23 @@ public class BulkExportService(
                 if (i > 0) { queryAll.Append(", "); }
                 queryAll.Append('[').Append(columns[i].name).Append(']');
             }
-            queryAll.Append(" FROM [").Append(table).Append("] WITH (NOLOCK);\n");
+            queryAll.Append(" FROM [").Append(table).Append("] WITH (NOLOCK)");
+
+            bool first = true;
+            foreach (var pkCol in columns.Where(c => c.pk))
+            {
+                if (first)
+                {
+                    queryAll.Append(" ORDER BY ");
+                    first = false;
+                }
+                else
+                {
+                    queryAll.Append(", ");
+                }
+                queryAll.Append('[').Append(pkCol.name).Append(']');
+            }
+            queryAll.Append(";\n");
         }
 
         queryAll.Append("ROLLBACK TRANSACTION");
