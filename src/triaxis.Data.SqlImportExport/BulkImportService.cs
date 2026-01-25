@@ -52,7 +52,7 @@ public class BulkImportService(
 
         await foreach (var source in input)
         {
-            if (options?.Truncate == true)
+            if ((source.Truncate ?? options?.Truncate) == true)
             {
                 logger.LogWarning("Replacing data in {TableName}", source.Name);
                 await sqlConnection.ExecuteAsync($"TRUNCATE TABLE {source.Name}");
