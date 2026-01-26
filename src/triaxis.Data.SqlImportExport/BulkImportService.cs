@@ -52,20 +52,42 @@ public class BulkImportService(
 
         await foreach (var source in input)
         {
-            if ((source.Truncate ?? options?.Truncate) == true)
+            var strategy = source.Strategy ?? options?.Strategy ?? BulkImportStrategy.Insert;
+            bool merge = false;
+            HashSet<string> identityColumns = [];
+            if (strategy == BulkImportStrategy.Truncate)
             {
                 logger.LogWarning("Replacing data in {TableName}", source.Name);
                 await sqlConnection.ExecuteAsync($"TRUNCATE TABLE {source.Name}", transaction);
             }
-            else
+            else if (strategy == BulkImportStrategy.Insert)
             {
                 logger.LogDebug("Importing data into {TableName}", source.Name);
+            }
+            else
+            {
+                merge = true;
+                logger.LogInformation("Merging data into {TableName} using strategy {Strategy}", source.Name, strategy);
+                identityColumns = (await sqlConnection.QueryAsync<string>($"""
+                    IF OBJECT_ID('tempdb..#{source.Name}') IS NOT NULL DROP TABLE #{source.Name};
+                    SELECT TOP 0 * INTO #{source.Name} FROM {source.Name};
+                    DECLARE @sql nvarchar(max);
+                    SELECT @sql = CONCAT(N'ALTER TABLE #{source.Name} ADD ',
+                        STRING_AGG(CONCAT('CONSTRAINT [', NEWID(), '] DEFAULT ',
+                            OBJECT_DEFINITION(default_object_id),
+                            ' FOR [', name, ']'), ','))
+                        FROM sys.columns
+                        WHERE object_id = OBJECT_ID('{source.Name}') AND default_object_id <> 0;
+                    EXEC sp_executesql @sql;
+                    SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('{source.Name}') AND is_identity = 1;
+                    """, transaction
+                )).ToHashSet(StringComparer.OrdinalIgnoreCase);
             }
 
             var fields = await source.GetColumnNamesAsync();
             await using var reader = source.EnumerateDataAsync().GetAsyncEnumerator();
             using var dataSource = new DataReader(fields, reader);
-            bcp.DestinationTableName = source.Name;
+            bcp.DestinationTableName = merge ? $"#{source.Name}" : source.Name;
             bcp.ColumnMappings.Clear();
 
             for (int i = 0; i < dataSource.Fields.Length; i++)
@@ -74,6 +96,33 @@ public class BulkImportService(
             }
 
             await bcp.WriteToServerAsync(dataSource);
+
+            if (merge)
+            {
+                string FormatFields(string prefix = "") => string.Join(", ", fields.Select(f => $"{prefix}[{f}]"));
+                string FormatUpdateSet() => string.Join(", ", fields.Where(f => !identityColumns.Contains(f)).Select(f => $"t.[{f}] = s.[{f}]"));
+
+                // perform the actual merge and drop the temp table
+                var sql = $"""
+                    DECLARE @condition NVARCHAR(max), @sql NVARCHAR(max);
+                    {(identityColumns.Any() ? $"SET IDENTITY_INSERT [{source.Name}] ON;" : "")}
+                    SELECT @condition = CONCAT('(', STRING_AGG(s, ') OR ('), ')')
+                        FROM (select STRING_AGG(CONCAT('s.[', c.name, '] = t.[', c.name, ']'), ' AND ') s from sys.columns c
+                        INNER JOIN sys.index_columns ic ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                        INNER JOIN sys.indexes ix ON ix.object_id = c.object_id AND ic.index_id = ix.index_id
+                        WHERE c.object_id = OBJECT_ID('{source.Name}')
+                        GROUP BY ix.index_id) x
+                    SET @sql = CONCAT(N'MERGE INTO {source.Name} t USING [#{source.Name}] s ON (', @condition, ')
+                        WHEN NOT MATCHED THEN INSERT ({FormatFields()}) VALUES ({FormatFields("s.")})
+                        {(strategy == BulkImportStrategy.Upsert ? $"WHEN MATCHED THEN UPDATE SET {FormatUpdateSet()}" : "")};
+                        ');
+                    EXEC sp_executesql @sql;
+                    {(identityColumns.Any() ? $"SET IDENTITY_INSERT [{source.Name}] OFF;" : "")}
+                    DROP TABLE [#{source.Name}];
+                    """;
+
+                await sqlConnection.ExecuteAsync(sql, transaction);
+            }
         }
 
         if (!(options?.SkipConstraints == true))
