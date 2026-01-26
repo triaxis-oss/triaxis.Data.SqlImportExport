@@ -55,7 +55,7 @@ public class BulkImportService(
             if ((source.Truncate ?? options?.Truncate) == true)
             {
                 logger.LogWarning("Replacing data in {TableName}", source.Name);
-                await sqlConnection.ExecuteAsync($"TRUNCATE TABLE {source.Name}");
+                await sqlConnection.ExecuteAsync($"TRUNCATE TABLE {source.Name}", transaction);
             }
             else
             {
