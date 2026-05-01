@@ -85,21 +85,7 @@ public class BulkImportService(
                 )).ToHashSet(StringComparer.OrdinalIgnoreCase);
             }
 
-            // Capture identity info before the import to compute the inserted range afterward
-            var identSeedValues = (await sqlConnection.QueryAsync<long>(
-                $"SELECT CONVERT(bigint, seed_value) FROM sys.identity_columns WHERE object_id = OBJECT_ID(N'{source.Name}')",
-                transaction)).ToList();
-            bool hasIdentity = identSeedValues.Count > 0;
-            long identSeed = hasIdentity ? identSeedValues[0] : 0;
-            long identIncr = hasIdentity
-                ? (await sqlConnection.QueryAsync<long>(
-                    $"SELECT CONVERT(bigint, increment_value) FROM sys.identity_columns WHERE object_id = OBJECT_ID(N'{source.Name}')",
-                    transaction)).First()
-                : 0;
-            long? prevIdentCurrent = hasIdentity
-                ? await sqlConnection.QueryScalarAsync<long>(
-                    $"SELECT CONVERT(bigint, IDENT_CURRENT(N'{source.Name}'))", transaction)
-                : null;
+            bool trackIds = !merge && options?.SkipIdentity == true;
 
             var fields = await source.GetColumnNamesAsync();
             await using var reader = source.EnumerateDataAsync().GetAsyncEnumerator();
@@ -141,14 +127,17 @@ public class BulkImportService(
                 await sqlConnection.ExecuteAsync(sql, transaction);
             }
 
-            if (hasIdentity)
+            if (trackIds && dataSource.RowCount > 0)
             {
-                var newIdentCurrent = await sqlConnection.QueryScalarAsync<long>(
-                    $"SELECT CONVERT(bigint, IDENT_CURRENT(N'{source.Name}'))", transaction);
-                if (newIdentCurrent.HasValue && newIdentCurrent != prevIdentCurrent)
+                var incrValues = (await sqlConnection.QueryAsync<long>(
+                    $"SELECT CONVERT(bigint, increment_value) FROM sys.identity_columns WHERE object_id = OBJECT_ID(N'{source.Name}')",
+                    transaction)).ToList();
+                if (incrValues.Count > 0)
                 {
-                    long firstId = prevIdentCurrent.HasValue ? prevIdentCurrent.Value + identIncr : identSeed;
-                    insertedIdRanges[source.Name] = new InsertedIdRange(firstId, newIdentCurrent.Value);
+                    long lastId = (await sqlConnection.QueryScalarAsync<long>(
+                        $"SELECT CONVERT(bigint, IDENT_CURRENT(N'{source.Name}'))", transaction))!.Value;
+                    long firstId = lastId - (long)(dataSource.RowCount - 1) * incrValues[0];
+                    insertedIdRanges[source.Name] = new InsertedIdRange(firstId, lastId);
                 }
             }
         }
@@ -203,6 +192,7 @@ public class BulkImportService(
         public int RecordsAffected => 0;
         public int FieldCount => _fields.Length;
         public string[] Fields => _fields;
+        public int RowCount { get; private set; }
 
         public void Close() { _data = null; }
         public void Dispose() { Close(); }
@@ -269,6 +259,7 @@ public class BulkImportService(
             }
 
             _values = _data.Current;
+            RowCount++;
             return true;
         }
     }
