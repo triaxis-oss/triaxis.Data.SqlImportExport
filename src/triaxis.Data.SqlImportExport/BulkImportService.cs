@@ -6,7 +6,7 @@ public class BulkImportService(
     ILogger<BulkImportService> logger
 ) : IBulkImportService
 {
-    public async Task<BulkImportResult> BulkImportAsync(SqlConnection sqlConnection, IAsyncEnumerable<IBulkImportSource> input, BulkImportOptions? options = null)
+    public async Task<IReadOnlyList<InsertedIdRange>> BulkImportAsync(SqlConnection sqlConnection, IAsyncEnumerable<IBulkImportSource> input, BulkImportOptions? options = null)
     {
         if (sqlConnection.State != ConnectionState.Open)
         {
@@ -49,7 +49,7 @@ public class BulkImportService(
             NotifyAfter = batchSize,
         };
 
-        var insertedIdRanges = new Dictionary<string, InsertedIdRange>(StringComparer.OrdinalIgnoreCase);
+        var insertedIdRanges = new List<InsertedIdRange>();
 
         await foreach (var source in input)
         {
@@ -129,15 +129,13 @@ public class BulkImportService(
 
             if (trackIds && dataSource.RowCount > 0)
             {
-                var incrValues = (await sqlConnection.QueryAsync<long>(
-                    $"SELECT CONVERT(bigint, increment_value) FROM sys.identity_columns WHERE object_id = OBJECT_ID(N'{source.Name}')",
+                var identInfo = (await sqlConnection.QueryAsync<(long Incr, long LastId)>(
+                    $"SELECT CONVERT(bigint, increment_value), CONVERT(bigint, IDENT_CURRENT(N'{source.Name}')) FROM sys.identity_columns WHERE object_id = OBJECT_ID(N'{source.Name}')",
                     transaction)).ToList();
-                if (incrValues.Count > 0)
+                if (identInfo.Count > 0)
                 {
-                    long lastId = (await sqlConnection.QueryScalarAsync<long>(
-                        $"SELECT CONVERT(bigint, IDENT_CURRENT(N'{source.Name}'))", transaction))!.Value;
-                    long firstId = lastId - (long)(dataSource.RowCount - 1) * incrValues[0];
-                    insertedIdRanges[source.Name] = new InsertedIdRange(firstId, lastId);
+                    var (incr, lastId) = identInfo[0];
+                    insertedIdRanges.Add(new InsertedIdRange(source.Name, lastId - (long)(dataSource.RowCount - 1) * incr, lastId));
                 }
             }
         }
@@ -168,7 +166,7 @@ public class BulkImportService(
             await transaction.CommitAsync();
         }
 
-        return new BulkImportResult(insertedIdRanges);
+        return insertedIdRanges;
     }
 
     private class DataReader : IDataReader

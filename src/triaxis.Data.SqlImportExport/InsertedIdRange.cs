@@ -1,3 +1,3 @@
 namespace triaxis.Data.SqlImportExport;
 
-public record InsertedIdRange(long First, long Last);
+public record InsertedIdRange(string SourceName, long First, long Last);
