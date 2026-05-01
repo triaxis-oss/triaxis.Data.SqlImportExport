@@ -6,7 +6,7 @@ public class BulkImportService(
     ILogger<BulkImportService> logger
 ) : IBulkImportService
 {
-    public async Task BulkImportAsync(SqlConnection sqlConnection, IAsyncEnumerable<IBulkImportSource> input, BulkImportOptions? options = null)
+    public async Task<BulkImportResult> BulkImportAsync(SqlConnection sqlConnection, IAsyncEnumerable<IBulkImportSource> input, BulkImportOptions? options = null)
     {
         if (sqlConnection.State != ConnectionState.Open)
         {
@@ -16,8 +16,7 @@ public class BulkImportService(
 
             try
             {
-                await BulkImportAsync(sqlConnection, input, options);
-                return;
+                return await BulkImportAsync(sqlConnection, input, options);
             }
             finally
             {
@@ -42,13 +41,15 @@ public class BulkImportService(
         }
 
         using var bcp = new SqlBulkCopy(sqlConnection,
-            SqlBulkCopyOptions.KeepIdentity, (SqlTransaction)transaction)
+            bcpOptions, (SqlTransaction)transaction)
         {
             BulkCopyTimeout = (int)(options?.Timeout ?? BulkImportOptions.DefaultTimeout).TotalSeconds,
             EnableStreaming = true,
             BatchSize = batchSize,
             NotifyAfter = batchSize,
         };
+
+        var insertedIdRanges = new Dictionary<string, InsertedIdRange>(StringComparer.OrdinalIgnoreCase);
 
         await foreach (var source in input)
         {
@@ -83,6 +84,22 @@ public class BulkImportService(
                     """, transaction
                 )).ToHashSet(StringComparer.OrdinalIgnoreCase);
             }
+
+            // Capture identity info before the import to compute the inserted range afterward
+            var identSeedValues = (await sqlConnection.QueryAsync<long>(
+                $"SELECT CONVERT(bigint, seed_value) FROM sys.identity_columns WHERE object_id = OBJECT_ID(N'{source.Name}')",
+                transaction)).ToList();
+            bool hasIdentity = identSeedValues.Count > 0;
+            long identSeed = hasIdentity ? identSeedValues[0] : 0;
+            long identIncr = hasIdentity
+                ? (await sqlConnection.QueryAsync<long>(
+                    $"SELECT CONVERT(bigint, increment_value) FROM sys.identity_columns WHERE object_id = OBJECT_ID(N'{source.Name}')",
+                    transaction)).First()
+                : 0;
+            long? prevIdentCurrent = hasIdentity
+                ? await sqlConnection.QueryScalarAsync<long>(
+                    $"SELECT CONVERT(bigint, IDENT_CURRENT(N'{source.Name}'))", transaction)
+                : null;
 
             var fields = await source.GetColumnNamesAsync();
             await using var reader = source.EnumerateDataAsync().GetAsyncEnumerator();
@@ -123,6 +140,17 @@ public class BulkImportService(
 
                 await sqlConnection.ExecuteAsync(sql, transaction);
             }
+
+            if (hasIdentity)
+            {
+                var newIdentCurrent = await sqlConnection.QueryScalarAsync<long>(
+                    $"SELECT CONVERT(bigint, IDENT_CURRENT(N'{source.Name}'))", transaction);
+                if (newIdentCurrent.HasValue && newIdentCurrent != prevIdentCurrent)
+                {
+                    long firstId = prevIdentCurrent.HasValue ? prevIdentCurrent.Value + identIncr : identSeed;
+                    insertedIdRanges[source.Name] = new InsertedIdRange(firstId, newIdentCurrent.Value);
+                }
+            }
         }
 
         if (!(options?.SkipConstraints == true))
@@ -150,6 +178,8 @@ public class BulkImportService(
         {
             await transaction.CommitAsync();
         }
+
+        return new BulkImportResult(insertedIdRanges);
     }
 
     private class DataReader : IDataReader

@@ -42,6 +42,17 @@ internal static class PrivateExtensions
         return result;
     }
 
+    public static async Task<T?> QueryScalarAsync<T>(this SqlConnection sqlConnection, string query, DbTransaction? transaction = null) where T : struct
+    {
+        await using var cmd = sqlConnection.CreateCommand();
+        cmd.CommandText = query;
+        if (transaction is SqlTransaction sqlTransaction)
+            cmd.Transaction = sqlTransaction;
+        var result = await cmd.ExecuteScalarAsync();
+        if (result is null or DBNull) return null;
+        return (T)Convert.ChangeType(result, typeof(T));
+    }
+
     public static async Task<int> ExecuteAsync(this SqlConnection sqlConnection, string command, DbTransaction? transaction = null)
     {
         await using var cmd = sqlConnection.CreateCommand();
