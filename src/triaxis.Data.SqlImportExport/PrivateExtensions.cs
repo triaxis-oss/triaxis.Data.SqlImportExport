@@ -10,17 +10,44 @@ internal static class PrivateExtensions
     /// </summary>
     public static async Task<IEnumerable<T>> QueryAsync<T>(this SqlConnection sqlConnection, string query, DbTransaction? transaction = null)
     {
-        await using var cmd = sqlConnection.CreateCommand();
-        var result = new List<T>();
+        await using var cmd = CreateCommand(sqlConnection, query, transaction);
+        using var reader = await cmd.ExecuteReaderAsync();
+        return await ReadAllAsync<T>(reader);
+    }
+
+    /// <summary>
+    /// Two-result-set variant of <see cref="QueryAsync{T}"/> — runs both selects in a single round trip.
+    /// </summary>
+    public static async Task<(IEnumerable<T1> First, IEnumerable<T2> Second)> QueryAsync<T1, T2>(this SqlConnection sqlConnection, string query, DbTransaction? transaction = null)
+    {
+        await using var cmd = CreateCommand(sqlConnection, query, transaction);
+        using var reader = await cmd.ExecuteReaderAsync();
+        var first = await ReadAllAsync<T1>(reader);
+        await reader.NextResultAsync();
+        var second = await ReadAllAsync<T2>(reader);
+        return (first, second);
+    }
+
+    private static SqlCommand CreateCommand(SqlConnection sqlConnection, string query, DbTransaction? transaction)
+    {
+        var cmd = sqlConnection.CreateCommand();
         cmd.CommandText = query;
         if (transaction is SqlTransaction sqlTransaction)
         {
             cmd.Transaction = sqlTransaction;
         }
+        return cmd;
+    }
 
-        using var reader = await cmd.ExecuteReaderAsync();
+    private static async Task<List<T>> ReadAllAsync<T>(DbDataReader reader)
+    {
+        var result = new List<T>();
+        if (reader.FieldCount == 0)
+        {
+            return result;
+        }
+
         var values = new object?[reader.FieldCount];
-
         while (await reader.ReadAsync())
         {
             reader.GetValues(values);
