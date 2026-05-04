@@ -8,7 +8,6 @@ public class BulkImportOptions
     public TimeSpan? Timeout { get; init; }
     public int? BatchSize { get; init; }
     public BulkImportStrategy Strategy { get; init; }
-    public bool SkipIdentity { get; init; }
     public bool KeepNulls { get; init; }
     public bool DryRun { get; init; }
     public bool SkipConstraints { get; init; }
