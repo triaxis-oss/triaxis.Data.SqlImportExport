@@ -50,6 +50,17 @@ public class BulkImportService(
         };
 
         var insertedIdRanges = new List<InsertedIdRange>();
+        var sourceIdentityMap = new Dictionary<IBulkImportSource, (long First, long Increment)>();
+
+        object ResolveReference(BulkImportSourceReference reference)
+        {
+            if (!sourceIdentityMap.TryGetValue(reference.Source, out var info))
+            {
+                throw new InvalidOperationException(
+                    $"Cannot resolve reference to source '{reference.Source.Name}' - it has not been processed yet, or its identity values were not tracked.");
+            }
+            return info.First + (long)reference.RowIndex * info.Increment;
+        }
 
         await foreach (var source in input)
         {
@@ -89,7 +100,7 @@ public class BulkImportService(
 
             var fields = await source.GetColumnNamesAsync();
             await using var reader = source.EnumerateDataAsync().GetAsyncEnumerator();
-            using var dataSource = new DataReader(fields, reader);
+            using var dataSource = new DataReader(fields, reader, ResolveReference);
             bcp.DestinationTableName = merge ? $"#{source.Name}" : source.Name;
             bcp.ColumnMappings.Clear();
 
@@ -135,7 +146,9 @@ public class BulkImportService(
                 if (identInfo.Count > 0)
                 {
                     var (incr, lastId) = identInfo[0];
-                    insertedIdRanges.Add(new InsertedIdRange(source.Name, lastId - (long)(dataSource.RowCount - 1) * incr, lastId));
+                    var firstId = lastId - (long)(dataSource.RowCount - 1) * incr;
+                    insertedIdRanges.Add(new InsertedIdRange(source.Name, firstId, lastId));
+                    sourceIdentityMap[source] = (firstId, incr);
                 }
             }
         }
@@ -172,13 +185,15 @@ public class BulkImportService(
     private class DataReader : IDataReader
     {
         private readonly string[] _fields;
+        private readonly Func<BulkImportSourceReference, object>? _resolveReference;
         private IAsyncEnumerator<object[]>? _data;
         private object[] _values = null!;
 
-        public DataReader(IEnumerable<string> fields, IAsyncEnumerator<object[]> data)
+        public DataReader(IEnumerable<string> fields, IAsyncEnumerator<object[]> data, Func<BulkImportSourceReference, object>? resolveReference = null)
         {
             _fields = fields.ToArray();
             _data = data;
+            _resolveReference = resolveReference;
         }
 
         public object this[int i] => _values[i];
@@ -257,6 +272,16 @@ public class BulkImportService(
             }
 
             _values = _data.Current;
+            if (_resolveReference != null)
+            {
+                for (int i = 0; i < _values.Length; i++)
+                {
+                    if (_values[i] is BulkImportSourceReference reference)
+                    {
+                        _values[i] = _resolveReference(reference);
+                    }
+                }
+            }
             RowCount++;
             return true;
         }
