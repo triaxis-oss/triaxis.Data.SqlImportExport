@@ -75,7 +75,6 @@ await _import.BulkImportAsync(con, CsvSource.FromDirectory("output/"), new BulkI
 await _import.BulkImportAsync(con, source, new BulkImportOptions
 {
     Strategy = BulkImportStrategy.InsertIgnore,
-    SkipIdentity = true,       // let SQL Server generate identity values instead of using source values
     KeepNulls = true,          // don't substitute column defaults for null values
     SkipConstraints = false,   // verify foreign key constraints after import (default: true)
     DryRun = true,             // roll back the transaction at the end; useful for validation
@@ -84,15 +83,14 @@ await _import.BulkImportAsync(con, source, new BulkImportOptions
 });
 ```
 
+Identity behavior is auto-detected per source: if the target's identity column appears in the source's fields, those values are preserved; otherwise the service generates the next sequential values from the table's current identity seed and assigns them to the inserted rows.
+
 ### Inserted ID range
 
-When `SkipIdentity = true` and the strategy is `Insert` or `Truncate`, the return value contains the range of identity values that SQL Server assigned to each table:
+When the source omits the identity column for an `Insert` or `Truncate` import, the return value contains the range of identity values assigned to each table:
 
 ```csharp
-var ranges = await _import.BulkImportAsync(con, CsvSource.FromDirectory("output/"), new BulkImportOptions
-{
-    SkipIdentity = true,
-});
+var ranges = await _import.BulkImportAsync(con, CsvSource.FromDirectory("output/"));
 
 foreach (var range in ranges)
 {

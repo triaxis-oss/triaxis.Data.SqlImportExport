@@ -29,19 +29,17 @@ public class BulkImportService(
 
         await using var transaction = await sqlConnection.BeginTransactionAsync();
 
-        SqlBulkCopyOptions bcpOptions = default;
-
-        if (!(options?.SkipIdentity == true))
-        {
-            bcpOptions |= SqlBulkCopyOptions.KeepIdentity;
-        }
+        // KeepIdentity stays on for every source. When the source supplies the
+        // identity column, those values are preserved. When it doesn't, we
+        // synthesize them in DataReader using IDENT_CURRENT + increment, so
+        // SqlBulkCopy still sees a value (SET IDENTITY_INSERT requires it).
+        SqlBulkCopyOptions bcpOptions = SqlBulkCopyOptions.KeepIdentity;
         if (options?.KeepNulls == true)
         {
             bcpOptions |= SqlBulkCopyOptions.KeepNulls;
         }
 
-        using var bcp = new SqlBulkCopy(sqlConnection,
-            bcpOptions, (SqlTransaction)transaction)
+        using var bcp = new SqlBulkCopy(sqlConnection, bcpOptions, (SqlTransaction)transaction)
         {
             BulkCopyTimeout = (int)(options?.Timeout ?? BulkImportOptions.DefaultTimeout).TotalSeconds,
             EnableStreaming = true,
@@ -50,16 +48,16 @@ public class BulkImportService(
         };
 
         var insertedIdRanges = new List<InsertedIdRange>();
-        var sourceIdentityMap = new Dictionary<IBulkImportSource, (long First, long Increment)>();
+        var sourceReferenceMap = new Dictionary<IBulkImportSource, Func<int, object>>();
 
         object ResolveReference(BulkImportSourceReference reference)
         {
-            if (!sourceIdentityMap.TryGetValue(reference.Source, out var info))
+            if (!sourceReferenceMap.TryGetValue(reference.Source, out var resolver))
             {
                 throw new InvalidOperationException(
-                    $"Cannot resolve reference to source '{reference.Source.Name}' - it has not been processed yet, or its identity values were not tracked.");
+                    $"Cannot resolve reference to source '{reference.Source.Name}' - it has not been processed yet, or its reference values were not tracked.");
             }
-            return info.First + (long)reference.RowIndex * info.Increment;
+            return resolver(reference.RowIndex);
         }
 
         await foreach (var source in input)
@@ -84,23 +82,62 @@ public class BulkImportService(
                     IF OBJECT_ID('tempdb..#{source.Name}') IS NOT NULL DROP TABLE #{source.Name};
                     SELECT TOP 0 * INTO #{source.Name} FROM {source.Name};
                     DECLARE @sql nvarchar(max);
-                    SELECT @sql = CONCAT(N'ALTER TABLE #{source.Name} ADD ',
-                        STRING_AGG(CONCAT('CONSTRAINT [', NEWID(), '] DEFAULT ',
+                    SELECT @sql = N'ALTER TABLE #{source.Name} ADD ' + STRING_AGG(CONCAT('CONSTRAINT [', NEWID(), '] DEFAULT ',
                             OBJECT_DEFINITION(default_object_id),
-                            ' FOR [', name, ']'), ','))
+                            ' FOR [', name, ']'), ',')
                         FROM sys.columns
                         WHERE object_id = OBJECT_ID('{source.Name}') AND default_object_id <> 0;
-                    EXEC sp_executesql @sql;
+                    IF @sql IS NOT NULL EXEC sp_executesql @sql;
                     SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('{source.Name}') AND is_identity = 1;
                     """, transaction
                 )).ToHashSet(StringComparer.OrdinalIgnoreCase);
             }
 
-            bool trackIds = !merge && options?.SkipIdentity == true;
+            bool trackIds = !merge;
 
             var fields = await source.GetColumnNamesAsync();
+            var fieldList = fields.ToList();
+            var fieldSet = new HashSet<string>(fieldList, StringComparer.OrdinalIgnoreCase);
+
+            Func<int, object>? generateLastColumn = null;
+            int captureColumnIndex = -1;
+            List<object>? capturedKeys = null;
+
+            if (trackIds)
+            {
+                var (identInfo, pkColumns) = await sqlConnection.QueryAsync<(string Name, long Increment, long First), string>($"""
+                    SELECT name, CONVERT(bigint, increment_value),
+                        ISNULL(CONVERT(bigint, last_value) + CONVERT(bigint, increment_value), CONVERT(bigint, seed_value))
+                        FROM sys.identity_columns WHERE object_id = OBJECT_ID(N'{source.Name}');
+
+                    SELECT c.name
+                        FROM sys.indexes i
+                        INNER JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+                        INNER JOIN sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id
+                        WHERE i.object_id = OBJECT_ID(N'{source.Name}') AND i.is_primary_key = 1
+                        ORDER BY ic.key_ordinal;
+                    """, transaction);
+
+                var ident = identInfo.FirstOrDefault();
+                if (ident.Name != null && !fieldSet.Contains(ident.Name))
+                {
+                    long start = ident.First;
+                    long incr = ident.Increment;
+                    generateLastColumn = i => start + (long)i * incr;
+                    fieldList.Add(ident.Name);
+                    fieldSet.Add(ident.Name);
+                }
+
+                var pkList = pkColumns.ToList();
+                if (pkList.Count == 1 && fieldSet.Contains(pkList[0]))
+                {
+                    captureColumnIndex = fieldList.FindIndex(f => string.Equals(f, pkList[0], StringComparison.OrdinalIgnoreCase));
+                    capturedKeys = [];
+                }
+            }
+
             await using var reader = source.EnumerateDataAsync().GetAsyncEnumerator();
-            using var dataSource = new DataReader(fields, reader, ResolveReference);
+            using var dataSource = new DataReader(fieldList, reader, ResolveReference, captureColumnIndex, capturedKeys, generateLastColumn);
             bcp.DestinationTableName = merge ? $"#{source.Name}" : source.Name;
             bcp.ColumnMappings.Clear();
 
@@ -140,15 +177,21 @@ public class BulkImportService(
 
             if (trackIds && dataSource.RowCount > 0)
             {
-                var identInfo = (await sqlConnection.QueryAsync<(long Incr, long LastId)>(
-                    $"SELECT CONVERT(bigint, increment_value), CONVERT(bigint, IDENT_CURRENT(N'{source.Name}')) FROM sys.identity_columns WHERE object_id = OBJECT_ID(N'{source.Name}')",
-                    transaction)).ToList();
-                if (identInfo.Count > 0)
+                if (generateLastColumn != null)
                 {
-                    var (incr, lastId) = identInfo[0];
-                    var firstId = lastId - (long)(dataSource.RowCount - 1) * incr;
+                    long firstId = (long)generateLastColumn(0);
+                    long lastId = (long)generateLastColumn(dataSource.RowCount - 1);
                     insertedIdRanges.Add(new InsertedIdRange(source.Name, firstId, lastId));
-                    sourceIdentityMap[source] = (firstId, incr);
+                }
+
+                if (capturedKeys != null)
+                {
+                    var keys = capturedKeys;
+                    sourceReferenceMap[source] = i => keys[i];
+                }
+                else if (generateLastColumn != null)
+                {
+                    sourceReferenceMap[source] = generateLastColumn;
                 }
             }
         }
@@ -186,17 +229,24 @@ public class BulkImportService(
     {
         private readonly string[] _fields;
         private readonly Func<BulkImportSourceReference, object>? _resolveReference;
+        private readonly int _captureColumnIndex;
+        private readonly List<object>? _captureTarget;
+        private readonly Func<int, object>? _generateLastColumn;
         private IAsyncEnumerator<object[]>? _data;
         private object[] _values = null!;
+        private object _syntheticValue = null!;
 
-        public DataReader(IEnumerable<string> fields, IAsyncEnumerator<object[]> data, Func<BulkImportSourceReference, object>? resolveReference = null)
+        public DataReader(IEnumerable<string> fields, IAsyncEnumerator<object[]> data, Func<BulkImportSourceReference, object>? resolveReference = null, int captureColumnIndex = -1, List<object>? captureTarget = null, Func<int, object>? generateLastColumn = null)
         {
             _fields = fields.ToArray();
             _data = data;
             _resolveReference = resolveReference;
+            _captureColumnIndex = captureColumnIndex;
+            _captureTarget = captureTarget;
+            _generateLastColumn = generateLastColumn;
         }
 
-        public object this[int i] => _values[i];
+        public object this[int i] => i < _values.Length ? _values[i] : _syntheticValue;
 
         public object this[string name] => throw new NotImplementedException();
 
@@ -219,28 +269,33 @@ public class BulkImportService(
         public string GetDataTypeName(int i) => throw new NotImplementedException();
         public DataTable? GetSchemaTable() => throw new NotImplementedException();
 
-        public bool GetBoolean(int i) => Convert.ToBoolean(_values[i]);
-        public byte GetByte(int i) => Convert.ToByte(_values[i]);
-        public char GetChar(int i) => Convert.ToChar(_values[i]);
-        public DateTime GetDateTime(int i) => Convert.ToDateTime(_values[i]);
-        public decimal GetDecimal(int i) => Convert.ToDecimal(_values[i]);
-        public double GetDouble(int i) => Convert.ToDouble(_values[i]);
-        public Type GetFieldType(int i) => _values[i]?.GetType() ?? DBNull.Value.GetType();
-        public float GetFloat(int i) => Convert.ToSingle(_values[i]);
-        public Guid GetGuid(int i) => (Guid)_values[i];
-        public short GetInt16(int i) => Convert.ToInt16(_values[i]);
-        public int GetInt32(int i) => Convert.ToInt32(_values[i]);
-        public long GetInt64(int i) => Convert.ToInt64(_values[i]);
-        public string GetString(int i) => _values[i].ToString() ?? "";
-        public object GetValue(int i) => _values[i];
+        public bool GetBoolean(int i) => Convert.ToBoolean(this[i]);
+        public byte GetByte(int i) => Convert.ToByte(this[i]);
+        public char GetChar(int i) => Convert.ToChar(this[i]);
+        public DateTime GetDateTime(int i) => Convert.ToDateTime(this[i]);
+        public decimal GetDecimal(int i) => Convert.ToDecimal(this[i]);
+        public double GetDouble(int i) => Convert.ToDouble(this[i]);
+        public Type GetFieldType(int i) => this[i]?.GetType() ?? DBNull.Value.GetType();
+        public float GetFloat(int i) => Convert.ToSingle(this[i]);
+        public Guid GetGuid(int i) => (Guid)this[i];
+        public short GetInt16(int i) => Convert.ToInt16(this[i]);
+        public int GetInt32(int i) => Convert.ToInt32(this[i]);
+        public long GetInt64(int i) => Convert.ToInt64(this[i]);
+        public string GetString(int i) => this[i].ToString() ?? "";
+        public object GetValue(int i) => this[i];
 
         public int GetValues(object[] values)
         {
             _values.CopyTo(values, 0);
+            if (_generateLastColumn != null)
+            {
+                values[_values.Length] = _syntheticValue;
+                return _values.Length + 1;
+            }
             return _values.Length;
         }
 
-        public bool IsDBNull(int i) => _values[i] == DBNull.Value;
+        public bool IsDBNull(int i) => this[i] == DBNull.Value;
 
         public string GetName(int i) => _fields[i];
         public int GetOrdinal(string name)
@@ -281,6 +336,14 @@ public class BulkImportService(
                         _values[i] = _resolveReference(reference);
                     }
                 }
+            }
+            if (_generateLastColumn != null)
+            {
+                _syntheticValue = _generateLastColumn(RowCount);
+            }
+            if (_captureTarget != null && _captureColumnIndex >= 0)
+            {
+                _captureTarget.Add(this[_captureColumnIndex]);
             }
             RowCount++;
             return true;
