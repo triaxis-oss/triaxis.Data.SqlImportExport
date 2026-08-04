@@ -644,7 +644,256 @@ public class BulkImportTests : SqlTestFixture
             Is.EqualTo(1), "FK should still be untrusted");
     }
 
+    [Test]
+    public async Task Insert_TwoSourcesSameTable_SynthesisContinuesAcrossSources()
+    {
+        // the seed is tracked in-process across sources instead of re-read per source,
+        // so the second source has to pick up where the first one stopped
+        await Connection.ExecAsync("CREATE TABLE Foo (Id int IDENTITY(1,1) PRIMARY KEY, Name nvarchar(50))");
+
+        var first = new ListSource("Foo", ["Name"], ["a"], ["b"]);
+        var second = new ListSource("Foo", ["Name"], ["c"]);
+
+        var ranges = await Service.BulkImportAsync(Connection, AsAsync(first, second));
+
+        Assert.That(ranges.Select(r => (r.First, r.Last)), Is.EqualTo(new[] { (1L, 2L), (3L, 3L) }));
+        var rows = await Connection.ReadAsync<Row>("SELECT Id, Name FROM Foo ORDER BY Id");
+        Assert.That(rows, Is.EqualTo(new[] { new Row(1, "a"), new Row(2, "b"), new Row(3, "c") }));
+    }
+
+    [Test]
+    public async Task Insert_SuppliedIdentityThenSynthesized_RereadsSeed()
+    {
+        // the first source moves the counter somewhere we didn't compute, so the tracked value
+        // has to be dropped and read back rather than assumed
+        await Connection.ExecAsync("CREATE TABLE Foo (Id int IDENTITY(1,1) PRIMARY KEY, Name nvarchar(50))");
+
+        var supplied = new ListSource("Foo", ["Id", "Name"], [100, "a"]);
+        var synthesized = new ListSource("Foo", ["Name"], ["b"]);
+
+        var ranges = await Service.BulkImportAsync(Connection, AsAsync(supplied, synthesized));
+
+        Assert.That(ranges, Has.Count.EqualTo(1));
+        Assert.That(ranges[0].First, Is.EqualTo(101));
+        var rows = await Connection.ReadAsync<Row>("SELECT Id, Name FROM Foo ORDER BY Id");
+        Assert.That(rows, Is.EqualTo(new[] { new Row(100, "a"), new Row(101, "b") }));
+    }
+
+    [Test]
+    public async Task Insert_MixedRowShapes_UnsuppliedColumnsTakeDefaults()
+    {
+        // one source, rows carrying different subsets of the declared column union
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int PRIMARY KEY, Name nvarchar(50) DEFAULT 'def', Tag nvarchar(20) DEFAULT 'tag');
+            """);
+
+        var src = new ListSource("Foo", ["Id", "Name", "Tag"],
+            [1, "supplied", "supplied-tag"],
+            [2, "supplied", DBNull.Value],
+            [3, DBNull.Value, DBNull.Value]);
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var rows = await Connection.ReadAsync<Triple>("SELECT Id, Name, Tag FROM Foo ORDER BY Id");
+        Assert.That(rows, Is.EqualTo(new[]
+        {
+            new Triple(1, "supplied", "supplied-tag"),
+            new Triple(2, "supplied", "tag"),
+            new Triple(3, "def", "tag"),
+        }));
+    }
+
+    [Test]
+    public async Task SortedBy_DeclaredOrder_LoadsSorted()
+    {
+        // clustered key is not the identity, so nothing is inferred - the source has to say so
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Code int NOT NULL, Name nvarchar(50),
+                CONSTRAINT PK_Foo PRIMARY KEY CLUSTERED (Code));
+            """);
+
+        var src = new ListSource("Foo", ["Code", "Name"], [1, "a"], [2, "b"], [3, "c"])
+        {
+            SortedBy = [new SqlBulkCopyColumnOrderHint("Code", SortOrder.Ascending)],
+        };
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        Assert.That(await Connection.ReadAsync<Row>("SELECT Code, Name FROM Foo ORDER BY Code"),
+            Is.EqualTo(new[] { new Row(1, "a"), new Row(2, "b"), new Row(3, "c") }));
+    }
+
+    [Test]
+    public async Task SortedBy_OrderTheRowsAreNotIn_Throws()
+    {
+        // proves the hint reaches the server rather than being quietly dropped
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Code int NOT NULL, Name nvarchar(50),
+                CONSTRAINT PK_Foo PRIMARY KEY CLUSTERED (Code));
+            """);
+
+        var src = new ListSource("Foo", ["Code", "Name"], [3, "c"], [1, "a"], [2, "b"])
+        {
+            SortedBy = [new SqlBulkCopyColumnOrderHint("Code", SortOrder.Ascending)],
+        };
+
+        Assert.That(
+            async () => await Service.BulkImportAsync(Connection, AsAsync(src)),
+            Throws.InstanceOf<SqlException>());
+    }
+
+    [Test]
+    public async Task IndexStrategy_Rebuild_ReenablesIndexesAndKeepsData()
+    {
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int IDENTITY(1,1) PRIMARY KEY, Name nvarchar(50), Value int);
+            CREATE NONCLUSTERED INDEX IX_Foo_Name ON Foo (Name);
+            CREATE NONCLUSTERED INDEX IX_Foo_Value ON Foo (Value);
+            """);
+
+        var rows = Enumerable.Range(0, 500).Select(i => new object[] { $"n{i}", i }).ToArray();
+        var src = new ListSource("Foo", ["Name", "Value"], rows);
+
+        await Service.BulkImportAsync(Connection, AsAsync(src),
+            new BulkImportOptions { IndexStrategy = BulkImportIndexStrategy.Rebuild });
+
+        Assert.That(
+            await Connection.ReadAsync<int>("SELECT CONVERT(int, is_disabled) FROM sys.indexes WHERE object_id = OBJECT_ID('Foo') AND index_id > 0"),
+            Is.All.Zero, "every index is back in service");
+        Assert.That((await Connection.ReadAsync<int>("SELECT COUNT(*) FROM Foo")).Single(), Is.EqualTo(500));
+        // read through the rebuilt index to prove its contents match the table
+        Assert.That((await Connection.ReadAsync<int>("SELECT COUNT(*) FROM Foo WITH (INDEX(IX_Foo_Name)) WHERE Name LIKE 'n1%'")).Single(),
+            Is.EqualTo(111));
+    }
+
+    [Test]
+    public async Task IndexStrategy_Rebuild_DryRun_LeavesIndexesEnabled()
+    {
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int PRIMARY KEY, Name nvarchar(50));
+            CREATE NONCLUSTERED INDEX IX_Foo_Name ON Foo (Name);
+            """);
+
+        var src = new ListSource("Foo", ["Id", "Name"], [1, "a"]);
+
+        await Service.BulkImportAsync(Connection, AsAsync(src),
+            new BulkImportOptions { IndexStrategy = BulkImportIndexStrategy.Rebuild, DryRun = true });
+
+        Assert.That(
+            (await Connection.ReadAsync<int>("SELECT CONVERT(int, is_disabled) FROM sys.indexes WHERE name = 'IX_Foo_Name'")).Single(),
+            Is.Zero, "rollback puts the index back");
+        Assert.That((await Connection.ReadAsync<int>("SELECT COUNT(*) FROM Foo")).Single(), Is.Zero);
+    }
+
+    [Test]
+    public async Task IndexStrategy_Rebuild_LeavesKeyAndForeignKeyIndexesAlone()
+    {
+        // a unique constraint's index and one a foreign key points at cannot be disabled;
+        // touching either would fail the import outright
+        await Connection.ExecAsync("""
+            CREATE TABLE Parent (Id int PRIMARY KEY, Code int NOT NULL CONSTRAINT UQ_Parent_Code UNIQUE);
+            CREATE TABLE Child (Id int PRIMARY KEY, ParentCode int NOT NULL
+                CONSTRAINT FK_Child_Parent FOREIGN KEY REFERENCES Parent(Code));
+            CREATE NONCLUSTERED INDEX IX_Child_ParentCode ON Child (ParentCode);
+            INSERT Parent VALUES (1, 42);
+            """);
+
+        var src = new ListSource("Child", ["Id", "ParentCode"], [1, 42]);
+
+        await Service.BulkImportAsync(Connection, AsAsync(src),
+            new BulkImportOptions { IndexStrategy = BulkImportIndexStrategy.Rebuild });
+
+        Assert.That((await Connection.ReadAsync<int>("SELECT COUNT(*) FROM Child")).Single(), Is.EqualTo(1));
+        Assert.That(
+            await Connection.ReadAsync<int>("SELECT CONVERT(int, is_disabled) FROM sys.indexes WHERE object_id IN (OBJECT_ID('Child'), OBJECT_ID('Parent')) AND index_id > 0"),
+            Is.All.Zero);
+    }
+
+    [Test]
+    public async Task SchemalessName_QualifiedAndBracketed_ResolveToSameTable()
+    {
+        await Connection.ExecAsync("CREATE TABLE Foo (Id int IDENTITY(1,1) PRIMARY KEY, Name nvarchar(50))");
+
+        var bare = new ListSource("Foo", ["Name"], ["a"]);
+        var qualified = new ListSource("dbo.Foo", ["Name"], ["b"]);
+        var bracketed = new ListSource("[dbo].[Foo]", ["Name"], ["c"]);
+
+        var ranges = await Service.BulkImportAsync(Connection, AsAsync(bare, qualified, bracketed));
+
+        Assert.That(ranges.Select(r => r.First), Is.EqualTo(new[] { 1L, 2L, 3L }),
+            "all three names share one identity counter");
+    }
+
+    [Test]
+    public async Task Insert_DescendingClusteredIdentity_LoadsWithoutClaimingOrder()
+    {
+        // synthesized values ascend, the clustered key descends - asserting a sort order the rows
+        // don't have fails the bulk copy outright, so the hint has to stay off here
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int IDENTITY(1,1) NOT NULL, Name nvarchar(50),
+                CONSTRAINT PK_Foo PRIMARY KEY CLUSTERED (Id DESC));
+            """);
+
+        var src = new ListSource("Foo", ["Name"], ["a"], ["b"], ["c"]);
+        var ranges = await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        Assert.That(ranges[0].First, Is.EqualTo(1));
+        Assert.That(await Connection.ReadAsync<Row>("SELECT Id, Name FROM Foo ORDER BY Id"),
+            Is.EqualTo(new[] { new Row(1, "a"), new Row(2, "b"), new Row(3, "c") }));
+    }
+
+    [Test]
+    public async Task Insert_ClusteredKeyIsNotTheIdentity_LoadsWithoutClaimingOrder()
+    {
+        // rows are sorted on the identity column, which says nothing about the clustered key
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int IDENTITY(1,1) NOT NULL PRIMARY KEY NONCLUSTERED, Sort nvarchar(10) NOT NULL);
+            CREATE CLUSTERED INDEX IX_Foo_Sort ON Foo (Sort);
+            """);
+
+        var src = new ListSource("Foo", ["Sort"], ["c"], ["a"], ["b"]);
+        var ranges = await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        Assert.That(ranges[0].Last, Is.EqualTo(3));
+        Assert.That((await Connection.ReadAsync<int>("SELECT COUNT(*) FROM Foo")).Single(), Is.EqualTo(3));
+    }
+
+    [Test]
+    public async Task MaxGrantPercent_InsertIgnore_StillInserts()
+    {
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int IDENTITY(1,1) PRIMARY KEY, Name nvarchar(50) UNIQUE);
+            INSERT Foo (Name) VALUES ('a');
+            """);
+
+        var src = new ListSource("Foo", ["Name"], ["a"], ["b"]) { Strategy = BulkImportStrategy.InsertIgnore };
+
+        await Service.BulkImportAsync(Connection, AsAsync(src), new BulkImportOptions { MaxGrantPercent = 2 });
+
+        Assert.That(await Connection.ReadAsync<string>("SELECT Name FROM Foo ORDER BY Name"),
+            Is.EqualTo(new[] { "a", "b" }));
+    }
+
+    [Test]
+    public async Task MaxGrantPercent_Merge_StillUpserts()
+    {
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int PRIMARY KEY, Name nvarchar(50));
+            INSERT Foo VALUES (1, 'old'), (2, 'old');
+            """);
+
+        var src = new ListSource("Foo", ["Id", "Name"],
+            [2, "updated"],
+            [3, "new"]) { Strategy = BulkImportStrategy.Upsert };
+
+        await Service.BulkImportAsync(Connection, AsAsync(src), new BulkImportOptions { MaxGrantPercent = 2 });
+
+        Assert.That(await Connection.ReadAsync<Row>("SELECT Id, Name FROM Foo ORDER BY Id"),
+            Is.EqualTo(new[] { new Row(1, "old"), new Row(2, "updated"), new Row(3, "new") }));
+    }
+
     private record Row(int Id, string Name);
+    private record Triple(int Id, string Name, string Tag);
     private record Pair(string Left, string Right);
     private record BigIntRow(long Id, string Name);
 }
