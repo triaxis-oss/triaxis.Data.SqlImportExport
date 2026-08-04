@@ -8,9 +8,9 @@ internal static class PrivateExtensions
     /// <summary>
     /// Quick and dirty single-column or tuple-mapping query
     /// </summary>
-    public static async Task<IEnumerable<T>> QueryAsync<T>(this SqlConnection sqlConnection, string query, DbTransaction? transaction = null)
+    public static async Task<IEnumerable<T>> QueryAsync<T>(this SqlConnection sqlConnection, string query, DbTransaction? transaction = null, params (string Name, object Value)[] parameters)
     {
-        await using var cmd = CreateCommand(sqlConnection, query, transaction);
+        await using var cmd = CreateCommand(sqlConnection, query, transaction, parameters);
         using var reader = await cmd.ExecuteReaderAsync();
         return await ReadAllAsync<T>(reader);
     }
@@ -20,7 +20,7 @@ internal static class PrivateExtensions
     /// </summary>
     public static async Task<(IEnumerable<T1> First, IEnumerable<T2> Second)> QueryAsync<T1, T2>(this SqlConnection sqlConnection, string query, DbTransaction? transaction = null)
     {
-        await using var cmd = CreateCommand(sqlConnection, query, transaction);
+        await using var cmd = CreateCommand(sqlConnection, query, transaction, []);
         using var reader = await cmd.ExecuteReaderAsync();
         var first = await ReadAllAsync<T1>(reader);
         await reader.NextResultAsync();
@@ -28,13 +28,17 @@ internal static class PrivateExtensions
         return (first, second);
     }
 
-    private static SqlCommand CreateCommand(SqlConnection sqlConnection, string query, DbTransaction? transaction)
+    private static SqlCommand CreateCommand(SqlConnection sqlConnection, string query, DbTransaction? transaction, (string Name, object Value)[] parameters)
     {
         var cmd = sqlConnection.CreateCommand();
         cmd.CommandText = query;
         if (transaction is SqlTransaction sqlTransaction)
         {
             cmd.Transaction = sqlTransaction;
+        }
+        foreach (var (name, value) in parameters)
+        {
+            cmd.Parameters.AddWithValue(name, value);
         }
         return cmd;
     }
@@ -69,13 +73,17 @@ internal static class PrivateExtensions
         return result;
     }
 
-    public static async Task<int> ExecuteAsync(this SqlConnection sqlConnection, string command, DbTransaction? transaction = null)
+    public static async Task<int> ExecuteAsync(this SqlConnection sqlConnection, string command, DbTransaction? transaction = null, int? timeout = null)
     {
         await using var cmd = sqlConnection.CreateCommand();
         cmd.CommandText = command;
         if (transaction is SqlTransaction sqlTransaction)
         {
             cmd.Transaction = sqlTransaction;
+        }
+        if (timeout is int seconds)
+        {
+            cmd.CommandTimeout = seconds;
         }
         return await cmd.ExecuteNonQueryAsync();
     }

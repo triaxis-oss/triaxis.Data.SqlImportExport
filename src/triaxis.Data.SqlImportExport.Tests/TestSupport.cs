@@ -16,6 +16,7 @@ internal sealed class ListSource : IBulkImportSource
 
     public string Name { get; }
     public BulkImportStrategy? Strategy { get; init; }
+    public IEnumerable<SqlBulkCopyColumnOrderHint> SortedBy { get; init; } = [];
 
     public Task<IEnumerable<string>> GetColumnNamesAsync()
         => Task.FromResult<IEnumerable<string>>(_columns);

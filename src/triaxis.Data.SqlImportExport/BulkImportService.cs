@@ -1,4 +1,5 @@
 using System.Data;
+using System.Data.Common;
 
 namespace triaxis.Data.SqlImportExport;
 
@@ -26,27 +27,33 @@ public class BulkImportService(
         }
 
         int batchSize = options?.BatchSize ?? BulkImportOptions.DefaultBatchSize;
+        bool keepNulls = options?.KeepNulls == true;
+        var indexStrategy = options?.IndexStrategy ?? BulkImportIndexStrategy.Maintain;
+        int timeout = (int)(options?.Timeout ?? BulkImportOptions.DefaultTimeout).TotalSeconds;
+        string grantCap = options?.MaxGrantPercent is int pct ? $"OPTION (MAX_GRANT_PERCENT = {pct})" : "";
 
         await using var transaction = await sqlConnection.BeginTransactionAsync();
 
+        var schema = await SchemaMetadata.LoadAsync(sqlConnection, transaction);
+
         // KeepIdentity stays on for every source. When the source supplies the
         // identity column, those values are preserved. When it doesn't, we
-        // synthesize them in DataReader using IDENT_CURRENT + increment, so
+        // synthesize them in DataReader using the tracked seed + increment, so
         // SqlBulkCopy still sees a value (SET IDENTITY_INSERT requires it).
         SqlBulkCopyOptions bcpOptions = SqlBulkCopyOptions.KeepIdentity;
-        if (options?.KeepNulls == true)
+        if (keepNulls)
         {
             bcpOptions |= SqlBulkCopyOptions.KeepNulls;
         }
 
         using var bcp = new SqlBulkCopy(sqlConnection, bcpOptions, (SqlTransaction)transaction)
         {
-            BulkCopyTimeout = (int)(options?.Timeout ?? BulkImportOptions.DefaultTimeout).TotalSeconds,
+            BulkCopyTimeout = timeout,
             EnableStreaming = true,
             BatchSize = batchSize,
-            NotifyAfter = batchSize,
         };
 
+        var disabledIndexes = new List<string>();
         var insertedIdRanges = new List<InsertedIdRange>();
         var sourceReferenceMap = new Dictionary<IBulkImportSource, Func<int, object>>();
 
@@ -62,35 +69,24 @@ public class BulkImportService(
 
         await foreach (var source in input)
         {
+            var table = schema[source.Name];
             var strategy = source.Strategy ?? options?.Strategy ?? BulkImportStrategy.Insert;
-            bool merge = false;
-            HashSet<string> identityColumns = [];
+            bool merge = strategy is BulkImportStrategy.Upsert or BulkImportStrategy.InsertIgnore;
+
             if (strategy == BulkImportStrategy.Truncate)
             {
                 logger.LogWarning("Replacing data in {TableName}", source.Name);
-                await sqlConnection.ExecuteAsync($"TRUNCATE TABLE {source.Name}", transaction);
+                await sqlConnection.ExecuteAsync($"TRUNCATE TABLE {source.Name}", transaction, timeout);
+                // TRUNCATE resets the identity counter back to the seed
+                table.ResetIdentity();
             }
-            else if (strategy == BulkImportStrategy.Insert)
+            else if (merge)
             {
-                logger.LogDebug("Importing data into {TableName}", source.Name);
+                logger.LogInformation("Merging data into {TableName} using strategy {Strategy}", source.Name, strategy);
             }
             else
             {
-                merge = true;
-                logger.LogInformation("Merging data into {TableName} using strategy {Strategy}", source.Name, strategy);
-                identityColumns = (await sqlConnection.QueryAsync<string>($"""
-                    IF OBJECT_ID('tempdb..#{source.Name}') IS NOT NULL DROP TABLE #{source.Name};
-                    SELECT TOP 0 * INTO #{source.Name} FROM {source.Name};
-                    DECLARE @sql nvarchar(max);
-                    SELECT @sql = N'ALTER TABLE #{source.Name} ADD ' + STRING_AGG(CONCAT('CONSTRAINT [', NEWID(), '] DEFAULT ',
-                            OBJECT_DEFINITION(default_object_id),
-                            ' FOR [', name, ']'), ',')
-                        FROM sys.columns
-                        WHERE object_id = OBJECT_ID('{source.Name}') AND default_object_id <> 0;
-                    IF @sql IS NOT NULL EXEC sp_executesql @sql;
-                    SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('{source.Name}') AND is_identity = 1;
-                    """, transaction
-                )).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                logger.LogDebug("Importing data into {TableName}", source.Name);
             }
 
             bool trackIds = !merge;
@@ -105,95 +101,126 @@ public class BulkImportService(
 
             if (trackIds)
             {
-                var (identInfo, pkColumns) = await sqlConnection.QueryAsync<(string Name, long Increment, long First), string>($"""
-                    SELECT name, CONVERT(bigint, increment_value),
-                        ISNULL(CONVERT(bigint, last_value) + CONVERT(bigint, increment_value), CONVERT(bigint, seed_value))
-                        FROM sys.identity_columns WHERE object_id = OBJECT_ID(N'{source.Name}');
-
-                    SELECT c.name
-                        FROM sys.indexes i
-                        INNER JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
-                        INNER JOIN sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id
-                        WHERE i.object_id = OBJECT_ID(N'{source.Name}') AND i.is_primary_key = 1
-                        ORDER BY ic.key_ordinal;
-                    """, transaction);
-
-                var ident = identInfo.FirstOrDefault();
-                if (ident.Name != null && !fieldSet.Contains(ident.Name))
+                if (table.IdentityColumn is string identityColumn && !fieldSet.Contains(identityColumn))
                 {
-                    long start = ident.First;
-                    long incr = ident.Increment;
+                    long start = await table.GetNextIdentityAsync(sqlConnection, transaction, source.Name);
+                    long incr = table.IdentityIncrement;
                     generateLastColumn = i => start + (long)i * incr;
-                    fieldList.Add(ident.Name);
-                    fieldSet.Add(ident.Name);
+                    fieldList.Add(identityColumn);
+                    fieldSet.Add(identityColumn);
                 }
 
-                var pkList = pkColumns.ToList();
-                if (pkList.Count == 1 && fieldSet.Contains(pkList[0]))
+                var pkColumns = table.PrimaryKeyColumns;
+                if (pkColumns.Count == 1 && fieldSet.Contains(pkColumns[0]))
                 {
-                    captureColumnIndex = fieldList.FindIndex(f => string.Equals(f, pkList[0], StringComparison.OrdinalIgnoreCase));
+                    captureColumnIndex = fieldList.FindIndex(f => string.Equals(f, pkColumns[0], StringComparison.OrdinalIgnoreCase));
                     capturedKeys = [];
                 }
             }
 
+            if (indexStrategy == BulkImportIndexStrategy.Rebuild && !table.IndexesDisabled && table.SecondaryIndexes.Count > 0)
+            {
+                table.IndexesDisabled = true;
+                logger.LogDebug("Disabling {Count} indexes on {TableName} for the duration of the import", table.SecondaryIndexes.Count, source.Name);
+                await sqlConnection.ExecuteAsync(string.Join(";\n",
+                    table.SecondaryIndexes.Select(ix => $"ALTER INDEX [{ix}] ON {source.Name} DISABLE")), transaction, timeout);
+                disabledIndexes.AddRange(table.SecondaryIndexes.Select(ix => $"ALTER INDEX [{ix}] ON {source.Name} REBUILD"));
+            }
+
+            // merging needs somewhere to put the incoming rows before matching them up
+            string destination = source.Name;
+            if (merge)
+            {
+                destination = $"#{source.Name}";
+                await CreateStagingTableAsync(sqlConnection, transaction, source.Name, replicateDefaults: !keepNulls && table.HasDefaults, timeout);
+            }
+
             await using var reader = source.EnumerateDataAsync().GetAsyncEnumerator();
             using var dataSource = new DataReader(fieldList, reader, ResolveReference, captureColumnIndex, capturedKeys, generateLastColumn);
-            bcp.DestinationTableName = merge ? $"#{source.Name}" : source.Name;
+            bcp.DestinationTableName = destination;
             bcp.ColumnMappings.Clear();
+            bcp.ColumnOrderHints.Clear();
 
             for (int i = 0; i < dataSource.Fields.Length; i++)
             {
                 bcp.ColumnMappings.Add(i, dataSource.Fields[i]);
             }
 
+            // The only thing SqlBulkCopy ever tells the server about the incoming rows is how they
+            // are sorted - it never sends a row count - so this is the one chance to spare it the
+            // clustered index sort and the memory grant that comes with it. The source knows its
+            // own order; failing that, we know the order of identity values we generated ourselves.
+            // Both are skipped when merging, where the rows land in a heap that has nothing to sort.
+            if (!merge)
+            {
+                foreach (var hint in source.SortedBy)
+                {
+                    bcp.ColumnOrderHints.Add(hint);
+                }
+
+                if (bcp.ColumnOrderHints.Count == 0
+                    && generateLastColumn != null && table.IdentityIncrement > 0 && !table.ClusteredKeyDescending
+                    && table.ClusteredKeyColumns is [var clusteredKey]
+                    && string.Equals(clusteredKey, table.IdentityColumn, StringComparison.OrdinalIgnoreCase))
+                {
+                    bcp.ColumnOrderHints.Add(clusteredKey, SortOrder.Ascending);
+                }
+            }
+
             await bcp.WriteToServerAsync(dataSource);
 
             if (merge)
             {
-                string FormatFields(string prefix = "") => string.Join(", ", fields.Select(f => $"{prefix}[{f}]"));
-                string FormatUpdateSet() => string.Join(", ", fields.Where(f => !identityColumns.Contains(f)).Select(f => $"t.[{f}] = s.[{f}]"));
-
-                // perform the actual merge and drop the temp table
-                var sql = $"""
-                    DECLARE @condition NVARCHAR(max), @sql NVARCHAR(max);
-                    {(identityColumns.Any() ? $"SET IDENTITY_INSERT [{source.Name}] ON;" : "")}
-                    SELECT @condition = CONCAT('(', STRING_AGG(s, ') OR ('), ')')
-                        FROM (select STRING_AGG(CONCAT('s.[', c.name, '] = t.[', c.name, ']'), ' AND ') s from sys.columns c
-                        INNER JOIN sys.index_columns ic ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-                        INNER JOIN sys.indexes ix ON ix.object_id = c.object_id AND ic.index_id = ix.index_id
-                        WHERE c.object_id = OBJECT_ID('{source.Name}')
-                        GROUP BY ix.index_id) x
-                    SET @sql = CONCAT(N'MERGE INTO {source.Name} t USING [#{source.Name}] s ON (', @condition, ')
-                        WHEN NOT MATCHED THEN INSERT ({FormatFields()}) VALUES ({FormatFields("s.")})
-                        {(strategy == BulkImportStrategy.Upsert ? $"WHEN MATCHED THEN UPDATE SET {FormatUpdateSet()}" : "")};
-                        ');
-                    EXEC sp_executesql @sql;
-                    {(identityColumns.Any() ? $"SET IDENTITY_INSERT [{source.Name}] OFF;" : "")}
-                    DROP TABLE [#{source.Name}];
-                    """;
-
-                await sqlConnection.ExecuteAsync(sql, transaction);
+                // the staging table carries its own identity values, so moving them across needs
+                // the destination's identity column opened up for explicit inserts
+                bool identityInsert = table.IdentityColumn != null && fieldSet.Contains(table.IdentityColumn);
+                await sqlConnection.ExecuteAsync(
+                    MergeSql(source.Name, fields, strategy, table, identityInsert, grantCap), transaction, timeout);
             }
 
-            if (trackIds && dataSource.RowCount > 0)
+            if (trackIds)
             {
                 if (generateLastColumn != null)
                 {
-                    long firstId = (long)generateLastColumn(0);
-                    long lastId = (long)generateLastColumn(dataSource.RowCount - 1);
-                    insertedIdRanges.Add(new InsertedIdRange(source.Name, firstId, lastId));
+                    // we picked every value ourselves, so the next one follows without re-reading it
+                    table.NextIdentity = (long)generateLastColumn(dataSource.RowCount);
+
+                    if (dataSource.RowCount > 0)
+                    {
+                        insertedIdRanges.Add(new InsertedIdRange(source.Name,
+                            (long)generateLastColumn(0), (long)generateLastColumn(dataSource.RowCount - 1)));
+                    }
+                }
+                else if (table.IdentityColumn != null && dataSource.RowCount > 0)
+                {
+                    // the source supplied the identity values, so the counter moved somewhere we
+                    // didn't compute - the next synthesis has to read it back
+                    table.NextIdentity = null;
                 }
 
-                if (capturedKeys != null)
+                if (dataSource.RowCount > 0)
                 {
-                    var keys = capturedKeys;
-                    sourceReferenceMap[source] = i => keys[i];
-                }
-                else if (generateLastColumn != null)
-                {
-                    sourceReferenceMap[source] = generateLastColumn;
+                    if (capturedKeys != null)
+                    {
+                        var keys = capturedKeys;
+                        sourceReferenceMap[source] = i => keys[i];
+                    }
+                    else if (generateLastColumn != null)
+                    {
+                        sourceReferenceMap[source] = generateLastColumn;
+                    }
                 }
             }
+            else if (table.IdentityColumn != null && dataSource.RowCount > 0)
+            {
+                table.NextIdentity = null;
+            }
+        }
+
+        if (disabledIndexes.Count > 0)
+        {
+            logger.LogDebug("Rebuilding {Count} indexes disabled for the import", disabledIndexes.Count);
+            await sqlConnection.ExecuteAsync(string.Join(";\n", disabledIndexes), transaction, timeout);
         }
 
         if (!(options?.SkipConstraints == true))
@@ -223,6 +250,52 @@ public class BulkImportService(
         }
 
         return insertedIdRanges;
+    }
+
+    /// <summary>
+    /// Creates an empty copy of the table in tempdb. SELECT INTO carries the column types and the
+    /// IDENTITY property but not the defaults, which bulk copy needs present to substitute NULLs.
+    /// </summary>
+    private static Task CreateStagingTableAsync(SqlConnection sqlConnection, DbTransaction transaction, string table, bool replicateDefaults, int timeout)
+        => sqlConnection.ExecuteAsync($"""
+            IF OBJECT_ID('tempdb..#{table}') IS NOT NULL DROP TABLE [#{table}];
+            SELECT TOP 0 * INTO [#{table}] FROM {table};
+            {(replicateDefaults ? $"""
+            DECLARE @sql nvarchar(max);
+            SELECT @sql = N'ALTER TABLE [#{table}] ADD ' + STRING_AGG(CONCAT('CONSTRAINT [', NEWID(), '] DEFAULT ',
+                    OBJECT_DEFINITION(default_object_id),
+                    ' FOR [', name, ']'), ',')
+                FROM sys.columns
+                WHERE object_id = OBJECT_ID('{table}') AND default_object_id <> 0;
+            IF @sql IS NOT NULL EXEC sp_executesql @sql;
+            """ : "")}
+            """, transaction, timeout);
+
+    private static string MergeSql(string table, IEnumerable<string> fields, BulkImportStrategy strategy, TableMetadata metadata, bool identityInsert, string grantCap)
+    {
+        string FormatFields(string prefix = "") => string.Join(", ", fields.Select(f => $"{prefix}[{f}]"));
+        string FormatUpdateSet() => string.Join(", ", fields
+            .Where(f => !string.Equals(f, metadata.IdentityColumn, StringComparison.OrdinalIgnoreCase))
+            .Select(f => $"t.[{f}] = s.[{f}]"));
+
+        return $"""
+            DECLARE @condition NVARCHAR(max), @sql NVARCHAR(max);
+            {(identityInsert ? $"SET IDENTITY_INSERT [{table}] ON;" : "")}
+            SELECT @condition = CONCAT('(', STRING_AGG(s, ') OR ('), ')')
+                FROM (select STRING_AGG(CONCAT('s.[', c.name, '] = t.[', c.name, ']'), ' AND ') s from sys.columns c
+                INNER JOIN sys.index_columns ic ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                INNER JOIN sys.indexes ix ON ix.object_id = c.object_id AND ic.index_id = ix.index_id
+                WHERE c.object_id = OBJECT_ID('{table}')
+                GROUP BY ix.index_id) x
+            SET @sql = CONCAT(N'MERGE INTO {table} t USING [#{table}] s ON (', @condition, ')
+                WHEN NOT MATCHED THEN INSERT ({FormatFields()}) VALUES ({FormatFields("s.")})
+                {(strategy == BulkImportStrategy.Upsert ? $"WHEN MATCHED THEN UPDATE SET {FormatUpdateSet()}" : "")}
+                {grantCap};
+                ');
+            EXEC sp_executesql @sql;
+            {(identityInsert ? $"SET IDENTITY_INSERT [{table}] OFF;" : "")}
+            DROP TABLE [#{table}];
+            """;
     }
 
     private class DataReader : IDataReader
