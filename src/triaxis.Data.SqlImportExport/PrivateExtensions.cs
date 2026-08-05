@@ -1,14 +1,21 @@
 using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 
 namespace triaxis.Data.SqlImportExport;
 
 internal static class PrivateExtensions
 {
+    private const DynamicallyAccessedMemberTypes Bindable = DynamicallyAccessedMemberTypes.PublicConstructors;
 
     /// <summary>
     /// Quick and dirty single-column or tuple-mapping query
     /// </summary>
-    public static async Task<IEnumerable<T>> QueryAsync<T>(this SqlConnection sqlConnection, string query, DbTransaction? transaction = null, params (string Name, object Value)[] parameters)
+    /// <remarks>
+    /// Rows are bound by invoking the constructor, which a trimmer has no way to see. The
+    /// annotation is what keeps it: it roots the constructors of whatever is asked for here, so
+    /// the binding still works in a trimmed application.
+    /// </remarks>
+    public static async Task<IEnumerable<T>> QueryAsync<[DynamicallyAccessedMembers(Bindable)] T>(this SqlConnection sqlConnection, string query, DbTransaction? transaction = null, params (string Name, object Value)[] parameters)
     {
         await using var cmd = CreateCommand(sqlConnection, query, transaction, parameters);
         using var reader = await cmd.ExecuteReaderAsync();
@@ -18,7 +25,7 @@ internal static class PrivateExtensions
     /// <summary>
     /// Two-result-set variant of <see cref="QueryAsync{T}"/> — runs both selects in a single round trip.
     /// </summary>
-    public static async Task<(IEnumerable<T1> First, IEnumerable<T2> Second)> QueryAsync<T1, T2>(this SqlConnection sqlConnection, string query, DbTransaction? transaction = null)
+    public static async Task<(IEnumerable<T1> First, IEnumerable<T2> Second)> QueryAsync<[DynamicallyAccessedMembers(Bindable)] T1, [DynamicallyAccessedMembers(Bindable)] T2>(this SqlConnection sqlConnection, string query, DbTransaction? transaction = null)
     {
         await using var cmd = CreateCommand(sqlConnection, query, transaction, []);
         using var reader = await cmd.ExecuteReaderAsync();
@@ -43,7 +50,7 @@ internal static class PrivateExtensions
         return cmd;
     }
 
-    private static async Task<List<T>> ReadAllAsync<T>(DbDataReader reader)
+    private static async Task<List<T>> ReadAllAsync<[DynamicallyAccessedMembers(Bindable)] T>(DbDataReader reader)
     {
         var result = new List<T>();
         if (reader.FieldCount == 0)
