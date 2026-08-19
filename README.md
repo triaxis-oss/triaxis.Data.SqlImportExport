@@ -180,6 +180,8 @@ Differently shaped rows mostly share one bulk copy regardless: without `KeepNull
 
 `MaxBufferedRows` (default 8192) decides how much memory may be spent grouping such rows. A source that fits the buffer — seed data, typically — costs one bulk copy per distinct group no matter how its rows interleave. A uniform stretch that outgrows the buffer — the big dataset — streams straight through, never holding more than the buffered rows; only a big source that keeps alternating between groups pays a flush per buffered chunk. Set it to zero to never buffer anything, writing each uniform run as it arrives, or raise it to regroup bigger jagged sources. There is no need to split a table into one source per distinct column set.
 
+Measured against SQL Server 2022 (the `shape` probe in `extra/bench`): 200k jagged rows load in the same time as 200k uniform ones — the grouping never fires when it isn't needed. Rows alternating groups every single row are what the buffer exists for: 20k of them measured 219 ms buffered against 69.6 s written run by run, and a 200-table seed tail of such rows 1.6 s against 41 s. Alternation in 1000-row blocks was indifferent to the setting.
+
 ### Declaring the order rows arrive in
 
 A bulk insert into an indexed table otherwise compiles a Sort for the clustered index and asks for a memory grant to run it. A source that already produces rows in clustered key order can say so and skip both:
