@@ -139,7 +139,10 @@ public class BulkImportService(
             await using var reader = source.EnumerateDataAsync().GetAsyncEnumerator();
             using var dataSource = new DataReader(fieldList, reader, ResolveReference, captureColumnIndex, capturedKeys, generateLastColumn, defaultColumns, notNullColumns);
 
-            if (merge)
+            // A source supplying no column at all has nothing to match on and nothing to carry
+            // across, so every row is just its defaults - which is what the plain insert path
+            // already does with rows shaped like that.
+            if (merge && fieldList.Count > 0)
             {
                 // Merging needs somewhere to put the incoming rows before matching them up. All of
                 // them land there in a single write with every column mapped, and the shape column
