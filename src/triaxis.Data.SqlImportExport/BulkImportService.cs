@@ -364,11 +364,13 @@ public class BulkImportService(
         // insert. INCLUDE columns are not part of the key and must not disqualify an index,
         // and the name comparison pins a case-insensitive collation so it agrees with the
         // client-side OrdinalIgnoreCase matching even on a case-sensitive database. Duplicate
-        // keys arriving under different shapes resolve in shape order, not source order.
+        // keys arriving under different shapes resolve in shape order, not source order. The
+        // condition is built with '+' rather than CONCAT so that no qualifying index leaves it
+        // NULL for ISNULL to catch, instead of collapsing into an empty '()'.
         string suppliedList = string.Join(", ", fields.Select(f => $"N'{f.Replace("'", "''")}'"));
         var sb = new StringBuilder($"""
             DECLARE @condition NVARCHAR(max), @sql NVARCHAR(max);
-            SELECT @condition = CONCAT('(', STRING_AGG(s, ') OR ('), ')')
+            SELECT @condition = '(' + STRING_AGG(s, ') OR (') + ')'
                 FROM (select STRING_AGG(CONCAT('s.[', c.name, '] = t.[', c.name, ']'), ' AND ') s from sys.columns c
                 INNER JOIN sys.index_columns ic ON ic.object_id = c.object_id AND ic.column_id = c.column_id AND ic.is_included_column = 0
                 INNER JOIN sys.indexes ix ON ix.object_id = c.object_id AND ic.index_id = ix.index_id

@@ -1005,6 +1005,39 @@ public class BulkImportTests : SqlTestFixture
     }
 
     [Test]
+    public async Task Upsert_NoMatchableIndex_InsertsEverything()
+    {
+        // the source misses part of every index key, so nothing can match and all rows insert
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int NOT NULL, Seq int NOT NULL DEFAULT 2, Name nvarchar(50),
+                CONSTRAINT PK_Foo PRIMARY KEY (Id, Seq));
+            INSERT Foo (Id, Seq, Name) VALUES (1, 1, 'old');
+            """);
+
+        var src = new ListSource("Foo", ["Id", "Name"],
+            [1, "added"]) { Strategy = BulkImportStrategy.Upsert };
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var names = await Connection.ReadAsync<string>("SELECT Name FROM Foo ORDER BY Seq");
+        Assert.That(names, Is.EqualTo(new[] { "old", "added" }));
+    }
+
+    [Test]
+    public async Task Upsert_TableWithoutIndexes_InsertsEverything()
+    {
+        await Connection.ExecAsync("CREATE TABLE Foo (Id int NULL, Name nvarchar(50) NULL)");
+
+        var src = new ListSource("Foo", ["Id", "Name"],
+            [1, "a"]) { Strategy = BulkImportStrategy.Upsert };
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var names = await Connection.ReadAsync<string>("SELECT Name FROM Foo");
+        Assert.That(names, Is.EqualTo(new[] { "a" }));
+    }
+
+    [Test]
     public async Task Upsert_SourceWithoutColumns_InsertsDefaultRows()
     {
         await Connection.ExecAsync("CREATE TABLE Foo (Id int IDENTITY PRIMARY KEY, Name nvarchar(50) DEFAULT 'def')");
