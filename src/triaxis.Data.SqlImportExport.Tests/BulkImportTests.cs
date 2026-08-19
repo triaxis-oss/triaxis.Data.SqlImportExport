@@ -1005,6 +1005,31 @@ public class BulkImportTests : SqlTestFixture
     }
 
     [Test]
+    public async Task Upsert_SourceWithoutColumns_InsertsDefaultRows()
+    {
+        await Connection.ExecAsync("CREATE TABLE Foo (Id int IDENTITY PRIMARY KEY, Name nvarchar(50) DEFAULT 'def')");
+
+        var src = new ListSource("Foo", [], [], []) { Strategy = BulkImportStrategy.Upsert };
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var names = await Connection.ReadAsync<string>("SELECT Name FROM Foo");
+        Assert.That(names, Is.EqualTo(new[] { "def", "def" }));
+    }
+
+    [Test]
+    public async Task Upsert_EmptySourceWithoutColumns_ImportsNothing()
+    {
+        await Connection.ExecAsync("CREATE TABLE Foo (Id int IDENTITY PRIMARY KEY, Name nvarchar(50) DEFAULT 'def')");
+
+        var src = new ListSource("Foo", []) { Strategy = BulkImportStrategy.Upsert };
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        Assert.That((await Connection.ReadAsync<int>("SELECT COUNT(*) FROM Foo")).Single(), Is.Zero);
+    }
+
+    [Test]
     public async Task Insert_SourceReusingRowArray_BuffersCopy()
     {
         // a source may legally reuse one row array across yields - buffered rows must be copies
