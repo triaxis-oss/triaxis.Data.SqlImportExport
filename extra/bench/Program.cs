@@ -110,6 +110,13 @@ internal static class Program
             return 0;
         }
 
+        if (args.Length > 0 && args[0] == "shape")
+        {
+            await ResetDatabaseAsync();
+            await ShapeProbe.RunAsync(BenchCs);
+            return 0;
+        }
+
         // comparing against an older build means swapping its assembly into this one's output
         // directory, so say which one actually got loaded rather than trusting the checkout
         Console.WriteLine($"library: DefaultBatchSize={BulkImportOptions.DefaultBatchSize}, " +
