@@ -83,7 +83,7 @@ public class CsvWriter : IAsyncDisposable
     private async ValueTask WriteFieldImplAsync(string? value)
     {
         // TODO: formatting
-        if (_itemIndex > 0)
+        if (_itemIndex++ > 0)
         {
             await _writer.WriteAsync(_separator);
         }
@@ -115,7 +115,6 @@ public class CsvWriter : IAsyncDisposable
         {
             await _writer.WriteAsync(value);
         }
-        _itemIndex++;
     }
 
     private async ValueTask EndRecordImplAsync()
