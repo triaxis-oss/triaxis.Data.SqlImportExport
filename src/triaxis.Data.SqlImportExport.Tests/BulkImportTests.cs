@@ -99,21 +99,7 @@ public class BulkImportTests : SqlTestFixture
     }
 
     [Test]
-    public async Task Insert_KeepNullsTrue_PreservesNulls()
-    {
-        await Connection.ExecAsync("CREATE TABLE Foo (Id int PRIMARY KEY, Name nvarchar(50) DEFAULT 'def')");
-
-        var src = new ListSource("Foo", ["Id", "Name"],
-            [1, DBNull.Value]);
-
-        await Service.BulkImportAsync(Connection, AsAsync(src), new BulkImportOptions { KeepNulls = true });
-
-        var name = (await Connection.ReadAsync<string?>("SELECT Name FROM Foo")).Single();
-        Assert.That(name, Is.Null);
-    }
-
-    [Test]
-    public async Task Insert_KeepNullsFalse_AppliesDefault()
+    public async Task Insert_DBNullCell_ColumnWithDefault_InsertsNull()
     {
         await Connection.ExecAsync("CREATE TABLE Foo (Id int PRIMARY KEY, Name nvarchar(50) DEFAULT 'def')");
 
@@ -123,7 +109,35 @@ public class BulkImportTests : SqlTestFixture
         await Service.BulkImportAsync(Connection, AsAsync(src));
 
         var name = (await Connection.ReadAsync<string?>("SELECT Name FROM Foo")).Single();
-        Assert.That(name, Is.EqualTo("def"));
+        Assert.That(name, Is.Null, "DBNull means a literal NULL, default or not");
+    }
+
+    [Test]
+    public async Task Insert_NullCell_ColumnWithDefault_AppliesDefault()
+    {
+        await Connection.ExecAsync("CREATE TABLE Foo (Id int PRIMARY KEY, Name nvarchar(50) DEFAULT 'def')");
+
+        var src = new ListSource("Foo", ["Id", "Name"],
+            [1, null]);
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var name = (await Connection.ReadAsync<string?>("SELECT Name FROM Foo")).Single();
+        Assert.That(name, Is.EqualTo("def"), "a null cell behaves like an INSERT omitting the column");
+    }
+
+    [Test]
+    public async Task Insert_NullCell_ColumnWithoutDefault_InsertsNull()
+    {
+        await Connection.ExecAsync("CREATE TABLE Foo (Id int PRIMARY KEY, Name nvarchar(50))");
+
+        var src = new ListSource("Foo", ["Id", "Name"],
+            [1, null]);
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var name = (await Connection.ReadAsync<string?>("SELECT Name FROM Foo")).Single();
+        Assert.That(name, Is.Null);
     }
 
     [Test]
@@ -537,10 +551,61 @@ public class BulkImportTests : SqlTestFixture
     }
 
     [Test]
-    public async Task Merge_KeepNullsFalse_AppliesDefaultsViaTempTable()
+    public async Task Merge_NullCell_InsertAppliesDefault()
     {
-        // exercises the merge-prep default-constraint replication: temp table needs the default
-        // copied across so that bulk copy substitutes NULLs from the source with the default.
+        // NOT NULL matters: the staging buffer has to hold the NULL standing in for "omitted"
+        // even where the real column would reject it
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int PRIMARY KEY, Name nvarchar(50), Status nvarchar(20) NOT NULL DEFAULT 'active');
+            """);
+
+        var src = new ListSource("Foo", ["Id", "Name", "Status"],
+            [1, "a", null]) { Strategy = BulkImportStrategy.Upsert };
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var status = (await Connection.ReadAsync<string?>("SELECT Status FROM Foo")).Single();
+        Assert.That(status, Is.EqualTo("active"));
+    }
+
+    [Test]
+    public async Task Upsert_NullCell_MatchedRow_LeavesColumnUntouched()
+    {
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int PRIMARY KEY, Name nvarchar(50), Status nvarchar(20) DEFAULT 'active');
+            INSERT Foo VALUES (1, 'old', 'kept');
+            """);
+
+        var src = new ListSource("Foo", ["Id", "Name", "Status"],
+            [1, "updated", null]) { Strategy = BulkImportStrategy.Upsert };
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var rows = await Connection.ReadAsync<Triple>("SELECT Id, Name, Status FROM Foo");
+        Assert.That(rows, Is.EqualTo(new[] { new Triple(1, "updated", "kept") }),
+            "a null cell means 'value not present' - the update must not touch the column");
+    }
+
+    [Test]
+    public async Task Upsert_DBNullCell_MatchedRow_OverwritesWithNull()
+    {
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int PRIMARY KEY, Name nvarchar(50), Status nvarchar(20) DEFAULT 'active');
+            INSERT Foo VALUES (1, 'old', 'kept');
+            """);
+
+        var src = new ListSource("Foo", ["Id", "Name", "Status"],
+            [1, "updated", DBNull.Value]) { Strategy = BulkImportStrategy.Upsert };
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var rows = await Connection.ReadAsync<Triple>("SELECT Id, Name, Status FROM Foo");
+        Assert.That(rows, Is.EqualTo(new[] { new Triple(1, "updated", null) }));
+    }
+
+    [Test]
+    public async Task Merge_DBNullCell_ColumnWithDefault_InsertsNull()
+    {
         await Connection.ExecAsync("""
             CREATE TABLE Foo (Id int PRIMARY KEY, Name nvarchar(50), Status nvarchar(20) DEFAULT 'active');
             """);
@@ -551,7 +616,7 @@ public class BulkImportTests : SqlTestFixture
         await Service.BulkImportAsync(Connection, AsAsync(src));
 
         var status = (await Connection.ReadAsync<string?>("SELECT Status FROM Foo")).Single();
-        Assert.That(status, Is.EqualTo("active"));
+        Assert.That(status, Is.Null, "DBNull survives the staging table despite the default");
     }
 
     [Test]
@@ -680,17 +745,20 @@ public class BulkImportTests : SqlTestFixture
     }
 
     [Test]
-    public async Task Insert_MixedRowShapes_UnsuppliedColumnsTakeDefaults()
+    public async Task Insert_MixedRowShapes_NullCellsTakeDefaults_DBNullStaysNull()
     {
-        // one source, rows carrying different subsets of the declared column union
+        // one source, rows carrying different subsets of the declared column union - each
+        // distinct shape goes to the server as its own bulk copy with the omitted columns
+        // unmapped, while DBNull stays a literal NULL within whatever shape it rides in
         await Connection.ExecAsync("""
             CREATE TABLE Foo (Id int PRIMARY KEY, Name nvarchar(50) DEFAULT 'def', Tag nvarchar(20) DEFAULT 'tag');
             """);
 
         var src = new ListSource("Foo", ["Id", "Name", "Tag"],
             [1, "supplied", "supplied-tag"],
-            [2, "supplied", DBNull.Value],
-            [3, DBNull.Value, DBNull.Value]);
+            [2, "supplied", null],
+            [3, null, null],
+            [4, DBNull.Value, null]);
 
         await Service.BulkImportAsync(Connection, AsAsync(src));
 
@@ -699,6 +767,432 @@ public class BulkImportTests : SqlTestFixture
         {
             new Triple(1, "supplied", "supplied-tag"),
             new Triple(2, "supplied", "tag"),
+            new Triple(3, "def", "tag"),
+            new Triple(4, null, "tag"),
+        }));
+    }
+
+    [Test]
+    public async Task Insert_MixedRowShapes_IdentitySynthesisSpansRuns()
+    {
+        // the synthesized identity values and the returned range have to run through all the
+        // per-shape bulk copies as if they were one
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int IDENTITY(1,1) PRIMARY KEY, Name nvarchar(50) DEFAULT 'def', Value int);
+            """);
+
+        var src = new ListSource("Foo", ["Name", "Value"],
+            ["a", 1],
+            ["b", null],
+            [null, 3],
+            ["d", 4]);
+
+        var ranges = await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        Assert.That(ranges, Has.Count.EqualTo(1));
+        Assert.That((ranges[0].First, ranges[0].Last), Is.EqualTo((1L, 4L)));
+
+        var rows = await Connection.ReadAsync<Triple>("SELECT Id, Name, CONVERT(nvarchar(20), Value) FROM Foo ORDER BY Id");
+        Assert.That(rows, Is.EqualTo(new[]
+        {
+            new Triple(1, "a", "1"),
+            new Triple(2, "b", null),
+            new Triple(3, "def", "3"),
+            new Triple(4, "d", "4"),
+        }));
+    }
+
+    [Test]
+    public async Task Insert_InterleavedShapes_BuffersAndRegroups_KeepsValuesAndIdentity()
+    {
+        // a source fitting the buffer is regrouped into one bulk copy per distinct shape; the
+        // synthesized identity values and the returned range have to come out as if the rows
+        // had streamed through in order
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int IDENTITY(1,1) PRIMARY KEY, Name nvarchar(50) NOT NULL DEFAULT 'def', Value int);
+            """);
+
+        var src = new ListSource("Foo", ["Name", "Value"],
+            ["a", 1],
+            [null, 2],
+            ["c", null],
+            ["d", 4],
+            [null, 5],
+            [null, null]);
+
+        var ranges = await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        Assert.That(ranges, Has.Count.EqualTo(1));
+        Assert.That((ranges[0].First, ranges[0].Last), Is.EqualTo((1L, 6L)));
+
+        var rows = await Connection.ReadAsync<Triple>("SELECT Id, Name, CONVERT(nvarchar(20), Value) FROM Foo ORDER BY Id");
+        Assert.That(rows, Is.EqualTo(new[]
+        {
+            new Triple(1, "a", "1"),
+            new Triple(2, "def", "2"),
+            new Triple(3, "c", null),
+            new Triple(4, "d", "4"),
+            new Triple(5, "def", "5"),
+            new Triple(6, "def", null),
+        }));
+    }
+
+    [Test]
+    public async Task Insert_InterleavedShapes_NoBuffering_StreamsEveryRun()
+    {
+        // MaxBufferedRows = 0 is the strictly-streaming mode: every run of same-shaped rows is
+        // its own bulk copy and nothing is ever held in memory - results must not differ
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int IDENTITY(1,1) PRIMARY KEY, Name nvarchar(50) NOT NULL DEFAULT 'def', Value int);
+            """);
+
+        var src = new ListSource("Foo", ["Name", "Value"],
+            ["a", 1],
+            [null, 2],
+            ["c", null],
+            [null, null]);
+
+        var ranges = await Service.BulkImportAsync(Connection, AsAsync(src), new BulkImportOptions { MaxBufferedRows = 0 });
+
+        Assert.That((ranges[0].First, ranges[0].Last), Is.EqualTo((1L, 4L)));
+        var rows = await Connection.ReadAsync<Triple>("SELECT Id, Name, CONVERT(nvarchar(20), Value) FROM Foo ORDER BY Id");
+        Assert.That(rows, Is.EqualTo(new[]
+        {
+            new Triple(1, "a", "1"),
+            new Triple(2, "def", "2"),
+            new Triple(3, "c", null),
+            new Triple(4, "def", null),
+        }));
+    }
+
+    [Test]
+    public async Task Insert_InterleavedShapes_TinyBuffer_FlushesInChunks()
+    {
+        // a source outgrowing the buffer with interleaved shapes flushes chunk by chunk, and a
+        // single-shape prefix filling the buffer streams on through the same write - both paths
+        // have to preserve values and the identity sequence
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int IDENTITY(1,1) PRIMARY KEY, Name nvarchar(50) NOT NULL DEFAULT 'def', Value int);
+            """);
+
+        var src = new ListSource("Foo", ["Name", "Value"],
+            ["a", 1],
+            ["b", 2],
+            ["c", 3],       // single-shape prefix longer than the buffer - streams live
+            [null, 4],
+            ["e", null],
+            [null, null],   // interleaved remainder - chunked regrouping
+            ["g", 7]);
+
+        var ranges = await Service.BulkImportAsync(Connection, AsAsync(src), new BulkImportOptions { MaxBufferedRows = 2 });
+
+        Assert.That((ranges[0].First, ranges[0].Last), Is.EqualTo((1L, 7L)));
+        var rows = await Connection.ReadAsync<Triple>("SELECT Id, Name, CONVERT(nvarchar(20), Value) FROM Foo ORDER BY Id");
+        Assert.That(rows, Is.EqualTo(new[]
+        {
+            new Triple(1, "a", "1"),
+            new Triple(2, "b", "2"),
+            new Triple(3, "c", "3"),
+            new Triple(4, "def", "4"),
+            new Triple(5, "e", null),
+            new Triple(6, "def", null),
+            new Triple(7, "g", "7"),
+        }));
+    }
+
+    [Test]
+    public async Task Insert_InterleavedShapes_AllNullRowInBufferedRemainder_InsertsDefaults()
+    {
+        // the all-null shape has no columns to map, so its buffered rows have to go through
+        // INSERT ... DEFAULT VALUES
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Name nvarchar(50) DEFAULT 'def', Tag nvarchar(20) DEFAULT 'tag');
+            """);
+
+        var src = new ListSource("Foo", ["Name", "Tag"],
+            ["a", null],
+            [null, "b"],
+            [null, null],
+            ["c", "d"]);
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var rows = await Connection.ReadAsync<Pair>("SELECT Name, Tag FROM Foo ORDER BY Name, Tag");
+        Assert.That(rows, Is.EqualTo(new[]
+        {
+            new Pair("a", "tag"),
+            new Pair("c", "d"),
+            new Pair("def", "b"),
+            new Pair("def", "tag"),
+        }));
+    }
+
+    [Test]
+    public async Task Insert_InterleavedClasses_SelfReferencingFK_DoesNotDependOnFlushOrder()
+    {
+        // regrouping flushes rows out of source order; the child of row 4 lands in the first
+        // write while row 4 itself - a literal NULL in a defaulted column puts it in the
+        // KeepNulls class - lands in the second, which must not fail: bulk copies load
+        // unchecked and leave the verification to the deferred constraint pass
+        await Connection.ExecAsync("""
+            CREATE TABLE Node (Id int PRIMARY KEY, ParentId int NULL FOREIGN KEY REFERENCES Node(Id), Tag nvarchar(20) DEFAULT 'x');
+            """);
+
+        var src = new ListSource("Node", ["Id", "ParentId", "Tag"],
+            [1, DBNull.Value, "root"],
+            [2, 1, null],
+            [3, 4, "child-of-4"],
+            [4, 1, DBNull.Value]);
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var tags = await Connection.ReadAsync<string?>("SELECT Tag FROM Node ORDER BY Id");
+        Assert.That(tags, Is.EqualTo(new[] { "root", "x", "child-of-4", null }));
+        Assert.That(
+            (await Connection.ReadAsync<int>("SELECT CONVERT(int, is_not_trusted) FROM sys.foreign_keys WHERE parent_object_id = OBJECT_ID('Node')")).Single(),
+            Is.Zero, "the deferred pass re-checked and re-trusted the FK");
+    }
+
+    [Test]
+    public async Task Insert_DBNull_NotNullColumnWithDefault_AppliesDefault()
+    {
+        // NULL is not storable there, so the only meaningful reading of DBNull is the default -
+        // this is also what keeps CSV files (which can only say DBNull) importable
+        await Connection.ExecAsync("CREATE TABLE Foo (Id int PRIMARY KEY, Status nvarchar(20) NOT NULL DEFAULT 'active')");
+
+        var src = new ListSource("Foo", ["Id", "Status"],
+            [1, DBNull.Value],
+            [2, "explicit"]);
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var statuses = await Connection.ReadAsync<string>("SELECT Status FROM Foo ORDER BY Id");
+        Assert.That(statuses, Is.EqualTo(new[] { "active", "explicit" }));
+    }
+
+    [Test]
+    public async Task Merge_XmlColumn_Works()
+    {
+        // the staging buffer must not force comparability on nullable columns - xml has no '='
+        await Connection.ExecAsync("CREATE TABLE Foo (Id int PRIMARY KEY, Body xml NULL)");
+
+        var src = new ListSource("Foo", ["Id", "Body"],
+            [1, "<a/>"]) { Strategy = BulkImportStrategy.Upsert };
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var body = (await Connection.ReadAsync<string>("SELECT CONVERT(nvarchar(max), Body) FROM Foo")).Single();
+        Assert.That(body, Is.EqualTo("<a/>"));
+    }
+
+    [Test]
+    public async Task Upsert_MatchIndexWithIncludedColumns_StillMatches()
+    {
+        // INCLUDE columns are not key columns and must not disqualify the index from matching
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int NOT NULL, Payload int NULL, Name nvarchar(50));
+            CREATE UNIQUE INDEX UQ_Foo ON Foo (Id) INCLUDE (Payload);
+            INSERT Foo VALUES (1, 5, 'old');
+            """);
+
+        var src = new ListSource("Foo", ["Id", "Name"],
+            [1, "updated"]) { Strategy = BulkImportStrategy.Upsert };
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var rows = await Connection.ReadAsync<Row>("SELECT Id, Name FROM Foo");
+        Assert.That(rows, Is.EqualTo(new[] { new Row(1, "updated") }));
+    }
+
+    [Test]
+    public async Task Insert_SourceReusingRowArray_BuffersCopy()
+    {
+        // a source may legally reuse one row array across yields - buffered rows must be copies
+        await Connection.ExecAsync("CREATE TABLE Foo (Id int PRIMARY KEY, N int)");
+
+        var reused = new object?[2];
+        async IAsyncEnumerable<object?[]> Rows()
+        {
+            await Task.CompletedTask;
+            for (int i = 0; i < 5; i++)
+            {
+                reused[0] = i + 1;
+                reused[1] = (i + 1) * 10;
+                yield return reused;
+            }
+        }
+
+        await Service.BulkImportAsync(Connection, AsAsync(new DelegateSource("Foo", ["Id", "N"], Rows)));
+
+        var rows = await Connection.ReadAsync<Row2>("SELECT Id, N FROM Foo ORDER BY Id");
+        Assert.That(rows, Is.EqualTo(new[]
+        {
+            new Row2(1, 10), new Row2(2, 20), new Row2(3, 30), new Row2(4, 40), new Row2(5, 50),
+        }));
+    }
+
+    [Test]
+    public async Task SortedBy_LeadingHintColumnOmitted_SuffixHintDropped()
+    {
+        // rows sorted by (A, B) are not sorted by B alone - a run that unmaps A must not keep
+        // the B hint, or the server rejects the load as incorrectly sorted
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (A int NOT NULL DEFAULT 1, B int NOT NULL, C nvarchar(10),
+                CONSTRAINT PK_Foo PRIMARY KEY CLUSTERED (A, B));
+            """);
+
+        var src = new ListSource("Foo", ["A", "B", "C"],
+            [2, 1, "x"],
+            [2, 2, "y"],
+            [null, 5, "p"],
+            [null, 3, "q"])
+        {
+            SortedBy = [new SqlBulkCopyColumnOrderHint("A", SortOrder.Ascending), new SqlBulkCopyColumnOrderHint("B", SortOrder.Ascending)],
+        };
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        Assert.That((await Connection.ReadAsync<int>("SELECT COUNT(*) FROM Foo")).Single(), Is.EqualTo(4));
+    }
+
+    [Test]
+    public async Task Insert_DefaultColumn_ValueNullAndDBNull_EachLandsCorrectly()
+    {
+        // the three meanings a cell can have in one defaulted column, interleaved in one source
+        await Connection.ExecAsync("CREATE TABLE Foo (Id int PRIMARY KEY, Status nvarchar(20) DEFAULT 'active')");
+
+        var src = new ListSource("Foo", ["Id", "Status"],
+            [1, "explicit"],
+            [2, DBNull.Value],
+            [3, null],
+            [4, DBNull.Value],
+            [5, "also-explicit"]);
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var statuses = await Connection.ReadAsync<string?>("SELECT Status FROM Foo ORDER BY Id");
+        Assert.That(statuses, Is.EqualTo(new[] { "explicit", null, "active", null, "also-explicit" }));
+    }
+
+    [Test]
+    public async Task Insert_NullIdentityCell_ServerAssigns()
+    {
+        // a null identity cell cannot ride as DBNull under KeepIdentity, so the identity column
+        // leaves the mapping for those rows and the server hands out the values
+        await Connection.ExecAsync("CREATE TABLE Foo (Id int IDENTITY(1,1) PRIMARY KEY, Name nvarchar(50))");
+
+        var src = new ListSource("Foo", ["Id", "Name"],
+            [null, "a"],
+            [10, "b"],
+            [null, "c"]);
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var rows = await Connection.ReadAsync<Row>("SELECT Id, Name FROM Foo ORDER BY Id");
+        Assert.That(rows, Is.EqualTo(new[] { new Row(1, "a"), new Row(2, "c"), new Row(10, "b") }));
+    }
+
+    [Test]
+    public async Task Reference_ToServerAssignedIdentityRow_Throws()
+    {
+        // the import never sees a server-assigned key, so referencing that row must fail loudly
+        // instead of resolving to NULL
+        await Connection.ExecAsync("""
+            CREATE TABLE Parent (Id int IDENTITY(1,1) PRIMARY KEY, Name nvarchar(50));
+            CREATE TABLE Child  (Id int IDENTITY(1,1) PRIMARY KEY, ParentId int NOT NULL FOREIGN KEY REFERENCES Parent(Id), Tag nvarchar(50));
+            """);
+
+        var parent = new ListSource("Parent", ["Id", "Name"],
+            [null, "server-assigned"],
+            [10, "supplied"]);
+        var child = new ListSource("Child", ["ParentId", "Tag"],
+            [new BulkImportSourceReference(parent, 0), "c-of-server-assigned"]);
+
+        Assert.That(
+            async () => await Service.BulkImportAsync(Connection, AsAsync(parent, child)),
+            Throws.InvalidOperationException.With.Message.Contains("server"));
+    }
+
+    [Test]
+    public async Task Reference_ToSuppliedRow_NextToServerAssignedRows_Resolves()
+    {
+        await Connection.ExecAsync("""
+            CREATE TABLE Parent (Id int IDENTITY(1,1) PRIMARY KEY, Name nvarchar(50));
+            CREATE TABLE Child  (Id int IDENTITY(1,1) PRIMARY KEY, ParentId int NOT NULL FOREIGN KEY REFERENCES Parent(Id), Tag nvarchar(50));
+            """);
+
+        var parent = new ListSource("Parent", ["Id", "Name"],
+            [null, "server-assigned"],
+            [10, "supplied"]);
+        var child = new ListSource("Child", ["ParentId", "Tag"],
+            [new BulkImportSourceReference(parent, 1), "c-of-supplied"]);
+
+        await Service.BulkImportAsync(Connection, AsAsync(parent, child));
+
+        Assert.That(
+            (await Connection.ReadAsync<int>("SELECT ParentId FROM Child")).Single(),
+            Is.EqualTo(10));
+    }
+
+    [Test]
+    public async Task Insert_OnlyIdentityColumn_AllNull_InsertsDefaultValuesRows()
+    {
+        // the one row left that maps nothing: identity omitted and no other columns declared -
+        // empty mappings would silently fall back to ordinal mapping, so these rows go through
+        // INSERT ... DEFAULT VALUES
+        await Connection.ExecAsync("CREATE TABLE Foo (Id int IDENTITY(1,1) PRIMARY KEY, Name nvarchar(50) DEFAULT 'def')");
+
+        var src = new ListSource("Foo", ["Id"], [null], [null]);
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var rows = await Connection.ReadAsync<Row>("SELECT Id, Name FROM Foo ORDER BY Id");
+        Assert.That(rows, Is.EqualTo(new[] { new Row(1, "def"), new Row(2, "def") }));
+    }
+
+    [Test]
+    public async Task Insert_AllCellsNull_InsertsDefaults()
+    {
+        // all-null rows ride the KeepNulls-off write like any others - every column mapped, the
+        // DBNulls on the wire asking the server for the defaults
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Name nvarchar(50) DEFAULT 'def', Tag nvarchar(20) DEFAULT 'tag');
+            """);
+
+        var src = new ListSource("Foo", ["Name", "Tag"],
+            [null, null],
+            [null, null],
+            ["x", null]);
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var names = await Connection.ReadAsync<string>("SELECT Name FROM Foo ORDER BY Name");
+        Assert.That(names, Is.EqualTo(new[] { "def", "def", "x" }));
+        Assert.That(
+            (await Connection.ReadAsync<int>("SELECT COUNT(*) FROM Foo WHERE Tag = 'tag'")).Single(),
+            Is.EqualTo(3));
+    }
+
+    [Test]
+    public async Task Merge_MixedRowShapes_InsertTakesDefaults_UpdateLeavesOmittedUntouched()
+    {
+        await Connection.ExecAsync("""
+            CREATE TABLE Foo (Id int PRIMARY KEY, Name nvarchar(50) DEFAULT 'def', Tag nvarchar(20) DEFAULT 'tag');
+            INSERT Foo VALUES (1, 'old', 'old-tag');
+            """);
+
+        var src = new ListSource("Foo", ["Id", "Name", "Tag"],
+            [1, "updated", null],
+            [2, null, "new-tag"],
+            [3, null, null]) { Strategy = BulkImportStrategy.Upsert };
+
+        await Service.BulkImportAsync(Connection, AsAsync(src));
+
+        var rows = await Connection.ReadAsync<Triple>("SELECT Id, Name, Tag FROM Foo ORDER BY Id");
+        Assert.That(rows, Is.EqualTo(new[]
+        {
+            new Triple(1, "updated", "old-tag"),
+            new Triple(2, "def", "new-tag"),
             new Triple(3, "def", "tag"),
         }));
     }
@@ -893,7 +1387,8 @@ public class BulkImportTests : SqlTestFixture
     }
 
     private record Row(int Id, string Name);
-    private record Triple(int Id, string Name, string Tag);
+    private record Row2(int Id, int N);
+    private record Triple(int Id, string? Name, string? Tag);
     private record Pair(string Left, string Right);
     private record BigIntRow(long Id, string Name);
 }

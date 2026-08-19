@@ -75,15 +75,15 @@ await _import.BulkImportAsync(con, CsvSource.FromDirectory("output/"), new BulkI
 await _import.BulkImportAsync(con, source, new BulkImportOptions
 {
     Strategy = BulkImportStrategy.InsertIgnore,
-    KeepNulls = true,          // don't substitute column defaults for null values
     SkipConstraints = false,   // verify foreign key constraints after import (default: true)
     DryRun = true,             // roll back the transaction at the end; useful for validation
     BatchSize = 0,             // rows per bulk copy batch; 0 sends a single batch (default: 1000)
+    MaxBufferedRows = 0,       // memory allowed for regrouping jagged rows (default: 8192; see below)
     Timeout = TimeSpan.FromMinutes(10),
 });
 ```
 
-`BatchSize` is round-trip bound, not memory bound. Streaming is enabled, so rows are never buffered on the client, and the whole import runs in one transaction, so splitting it buys no durability — every batch just costs another round trip. Loading 164k rows measured 2,208 ms at the default of 1000, 1,157 ms at 10,000, and fastest as a single batch, so raise it or set it to zero for a large import over a connection you trust. It makes no difference to tables holding a handful of rows, which are one batch either way.
+`BatchSize` is round-trip bound, not memory bound. Streaming is enabled, so rows are not buffered on the client (beyond the bounded `MaxBufferedRows` used for [jagged row shapes](#rows-of-differing-shapes)), and the whole import runs in one transaction, so splitting it buys no durability — every batch just costs another round trip. Loading 164k rows measured 2,208 ms at the default of 1000, 1,157 ms at 10,000, and fastest as a single batch, so raise it or set it to zero for a large import over a connection you trust. It makes no difference to tables holding a handful of rows, which are one batch either way.
 
 Identity behavior is auto-detected per source: if the target's identity column appears in the source's fields, those values are preserved; otherwise the service generates the next sequential values from the table's current identity seed and assigns them to the inserted rows.
 
@@ -148,7 +148,7 @@ public class MySource : IBulkImportSource
     public Task<IEnumerable<string>> GetColumnNamesAsync() =>
         Task.FromResult<IEnumerable<string>>(["Id", "Name", "Value"]);
 
-    public async IAsyncEnumerable<object[]> EnumerateDataAsync()
+    public async IAsyncEnumerable<object?[]> EnumerateDataAsync()
     {
         await foreach (var item in GetItemsAsync())
             yield return [item.Id, item.Name, item.Value];
@@ -160,20 +160,25 @@ Then pass it to `BulkImportAsync` as an `IAsyncEnumerable<IBulkImportSource>`.
 
 ### Rows of differing shapes
 
-One source can carry rows that don't all supply the same columns. Declare the union of the columns and pass `DBNull.Value` for the ones a row doesn't carry:
+One source can carry rows that don't all supply the same columns. Declare the union of the columns and leave the cells a row doesn't carry as `null`:
 
 ```csharp
 public Task<IEnumerable<string>> GetColumnNamesAsync() =>
     Task.FromResult<IEnumerable<string>>(["Id", "Name", "Value"]);
 
-public async IAsyncEnumerable<object[]> EnumerateDataAsync()
+public async IAsyncEnumerable<object?[]> EnumerateDataAsync()
 {
     yield return [1, "named", 42];
-    yield return [2, DBNull.Value, 7];   // no Name: takes the column default
+    yield return [2, null, 7];           // no Name: behaves as if the column were omitted
+    yield return [3, DBNull.Value, 9];   // explicit NULL, even where the column has a default
 }
 ```
 
-Those land in the destination as the column's default, or as NULL when `KeepNulls` is set. There is no need to split a table into one source per distinct column set.
+A `null` cell behaves exactly like a statement that omits the column — on insert the default applies when there is one (NULL otherwise), and on an `Upsert` update of a matched row the column is left untouched — while `DBNull.Value` lands as a literal NULL wherever NULL is storable (aimed at a NOT NULL column with a default, where it cannot be, it degrades to omitted — which also keeps CSV files importable into such columns). Both work per cell, with no option to set.
+
+Differently shaped rows mostly share one bulk copy regardless: without `KeepNulls`, a NULL on the wire already means "column default where one exists, NULL otherwise" — exactly what an omitted cell asks for — so omitted cells simply travel as NULLs. A row needs a separate write only when it puts an explicit `DBNull.Value` into a column that has a default (forcing `KeepNulls` for its batch), or omits a NOT NULL column (which must leave the column mapping).
+
+`MaxBufferedRows` (default 8192) decides how much memory may be spent grouping such rows. A source that fits the buffer — seed data, typically — costs one bulk copy per distinct group no matter how its rows interleave. A uniform stretch that outgrows the buffer — the big dataset — streams straight through, never holding more than the buffered rows; only a big source that keeps alternating between groups pays a flush per buffered chunk. Set it to zero to never buffer anything, writing each uniform run as it arrives, or raise it to regroup bigger jagged sources. There is no need to split a table into one source per distinct column set.
 
 ### Declaring the order rows arrive in
 

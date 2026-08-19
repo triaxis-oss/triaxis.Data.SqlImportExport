@@ -22,11 +22,11 @@ internal sealed class SchemaMetadata
             SELECT OBJECT_SCHEMA_NAME(c.object_id), OBJECT_NAME(c.object_id), c.name, c.is_identity,
                 CONVERT(bigint, ic.increment_value), CONVERT(bigint, ic.seed_value),
                 ISNULL(CONVERT(bigint, ic.last_value) + CONVERT(bigint, ic.increment_value), CONVERT(bigint, ic.seed_value)),
-                CONVERT(bit, IIF(c.default_object_id <> 0, 1, 0))
+                CONVERT(bit, IIF(c.default_object_id <> 0, 1, 0)), CONVERT(bit, IIF(c.is_nullable = 0, 1, 0))
                 FROM sys.columns c
                 INNER JOIN sys.tables t ON t.object_id = c.object_id
                 LEFT JOIN sys.identity_columns ic ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-                WHERE c.is_identity = 1 OR c.default_object_id <> 0;
+                WHERE c.is_identity = 1 OR c.default_object_id <> 0 OR c.is_nullable = 0;
 
             SELECT OBJECT_SCHEMA_NAME(i.object_id), OBJECT_NAME(i.object_id), CONVERT(bit, i.is_primary_key), c.name, i.name,
                 CONVERT(bit, IIF(i.index_id = 1, 1, 0)), CONVERT(bit, ic.is_descending_key),
@@ -57,7 +57,11 @@ internal sealed class SchemaMetadata
             }
             if (c.HasDefault)
             {
-                table.HasDefaults = true;
+                table.DefaultColumns.Add(c.Column);
+            }
+            if (c.NotNull)
+            {
+                table.NotNullColumns.Add(c.Column);
             }
         }
 
@@ -87,8 +91,9 @@ internal sealed class SchemaMetadata
     }
 
     /// <summary>
-    /// Metadata for a table the import targets. Tables with no identity column, no defaults and
-    /// no indexes never show up in either query, so an absent entry is a valid empty one.
+    /// Metadata for a table the import targets. Tables with no identity column, no defaults, no
+    /// NOT NULL columns and no indexes never show up in either query, so an absent entry is a
+    /// valid empty one.
     /// </summary>
     public TableMetadata this[string name]
     {
@@ -115,7 +120,7 @@ internal sealed class SchemaMetadata
 
     private static string Unquote(string name) => name.Replace("[", "").Replace("]", "");
 
-    private record ColumnRow(string Schema, string Table, string Column, bool IsIdentity, long? Increment, long? Seed, long? Next, bool HasDefault);
+    private record ColumnRow(string Schema, string Table, string Column, bool IsIdentity, long? Increment, long? Seed, long? Next, bool HasDefault, bool NotNull);
     private record IndexRow(string Schema, string Table, bool IsPrimaryKey, string Column, string Index, bool IsClustered, bool IsDescending, bool CanDisable);
 }
 
@@ -130,7 +135,8 @@ internal sealed class TableMetadata
     public bool ClusteredKeyDescending { get; set; }
     /// <summary>Nonclustered indexes that may be disabled for the duration of a load.</summary>
     public List<string> SecondaryIndexes { get; } = [];
-    public bool HasDefaults { get; set; }
+    public HashSet<string> DefaultColumns { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public HashSet<string> NotNullColumns { get; } = new(StringComparer.OrdinalIgnoreCase);
     public bool IndexesDisabled { get; set; }
 
     /// <summary>

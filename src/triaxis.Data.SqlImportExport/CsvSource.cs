@@ -31,7 +31,7 @@ public class CsvSource : IBulkImportSource
     public async Task<IEnumerable<string>> GetColumnNamesAsync()
         => await EnsureFieldsAsync();
 
-    public async IAsyncEnumerable<object[]> EnumerateDataAsync()
+    public async IAsyncEnumerable<object?[]> EnumerateDataAsync()
     {
         while (await ReadRecordAsync() is { } record)
         {
@@ -68,6 +68,13 @@ public class CsvSource : IBulkImportSource
         await foreach (var value in ParseLine(line))
         {
             res[i++] = value;
+        }
+        // the exporter writes NULL as an empty field, which at the end of a line simply ends it
+        // early - so a missing trailing field is an explicit NULL, not a request for the default
+        // (CSV cannot express the difference anyway)
+        while (i < res.Length)
+        {
+            res[i++] = DBNull.Value;
         }
         return res;
     }
