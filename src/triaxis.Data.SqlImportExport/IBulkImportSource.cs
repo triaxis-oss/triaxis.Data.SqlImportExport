@@ -27,10 +27,14 @@ public interface IBulkImportSource
     Task<IEnumerable<string>> GetColumnNamesAsync();
     /// <summary>
     /// Rows, each as wide as the column list. Rows need not all carry the same columns: declare
-    /// the union above and pass <see cref="DBNull.Value"/> for the ones a row does not supply,
-    /// which land in the destination as the column default, or as NULL when
-    /// <see cref="BulkImportOptions.KeepNulls"/> is set. There is no need to split a table into
-    /// one source per distinct column set.
+    /// the union above and leave the cells a row does not supply <c>null</c>, which behaves
+    /// exactly like a statement omitting the column - on insert the column default applies when
+    /// there is one (NULL otherwise), and on an <see cref="BulkImportStrategy.Upsert"/> update
+    /// of a matched row the column is left untouched. <see cref="DBNull.Value"/> is a literal
+    /// NULL wherever NULL is storable; aimed at a NOT NULL column with a default - where the
+    /// default is the only meaningful outcome - it degrades to omitted. There is no need to
+    /// split a table into one source per distinct column set, and a source may reuse one row
+    /// array across yields - the import copies whatever it has to retain.
     /// </summary>
-    IAsyncEnumerable<object[]> EnumerateDataAsync();
+    IAsyncEnumerable<object?[]> EnumerateDataAsync();
 }

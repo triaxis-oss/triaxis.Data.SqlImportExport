@@ -5,9 +5,9 @@ namespace triaxis.Data.SqlImportExport.Tests;
 internal sealed class ListSource : IBulkImportSource
 {
     private readonly string[] _columns;
-    private readonly object[][] _rows;
+    private readonly object?[][] _rows;
 
-    public ListSource(string name, string[] columns, params object[][] rows)
+    public ListSource(string name, string[] columns, params object?[][] rows)
     {
         Name = name;
         _columns = columns;
@@ -21,7 +21,7 @@ internal sealed class ListSource : IBulkImportSource
     public Task<IEnumerable<string>> GetColumnNamesAsync()
         => Task.FromResult<IEnumerable<string>>(_columns);
 
-    public async IAsyncEnumerable<object[]> EnumerateDataAsync()
+    public async IAsyncEnumerable<object?[]> EnumerateDataAsync()
     {
         await Task.CompletedTask;
         foreach (var r in _rows)
@@ -29,6 +29,16 @@ internal sealed class ListSource : IBulkImportSource
             yield return r;
         }
     }
+}
+
+internal sealed class DelegateSource(string name, string[] columns, Func<IAsyncEnumerable<object?[]>> rows) : IBulkImportSource
+{
+    public string Name => name;
+
+    public Task<IEnumerable<string>> GetColumnNamesAsync()
+        => Task.FromResult<IEnumerable<string>>(columns);
+
+    public IAsyncEnumerable<object?[]> EnumerateDataAsync() => rows();
 }
 
 internal static class TestHelpers

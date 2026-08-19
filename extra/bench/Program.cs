@@ -325,7 +325,7 @@ internal sealed class GeneratedSource : IBulkImportSource
     public Task<IEnumerable<string>> GetColumnNamesAsync()
         => Task.FromResult(Enumerable.Range(0, _columns).Select(i => $"C{i}"));
 
-    public async IAsyncEnumerable<object[]> EnumerateDataAsync()
+    public async IAsyncEnumerable<object?[]> EnumerateDataAsync()
     {
         await Task.CompletedTask;
         var epoch = new DateTime(2020, 1, 1);

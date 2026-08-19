@@ -15,8 +15,19 @@ public class BulkImportOptions
     /// </remarks>
     public const int DefaultBatchSize = 1000;
 
+    public const int DefaultMaxBufferedRows = 8192;
+
     public TimeSpan? Timeout { get; init; }
     public int? BatchSize { get; init; }
+    /// <summary>
+    /// Rows the import may hold in memory to regroup a source whose rows cannot all share one
+    /// bulk copy (see <see cref="IBulkImportSource.EnumerateDataAsync"/>), trading memory for
+    /// round trips. A source fitting the buffer costs one bulk copy per distinct row group
+    /// however its rows interleave; a longer uniform stretch streams straight through, the
+    /// buffer only ever holding its first rows. Zero never buffers: every uniform run is
+    /// written as it arrives, favoring strictly bounded memory over round trips.
+    /// </summary>
+    public int? MaxBufferedRows { get; init; }
     public BulkImportStrategy Strategy { get; init; }
     public BulkImportIndexStrategy IndexStrategy { get; init; }
     /// <summary>
@@ -31,7 +42,6 @@ public class BulkImportOptions
     /// spills the sort to tempdb rather than failing, so this trades a hard stop for a slower sort.
     /// </remarks>
     public int? MaxGrantPercent { get; init; }
-    public bool KeepNulls { get; init; }
     public bool DryRun { get; init; }
     public bool SkipConstraints { get; init; }
 }

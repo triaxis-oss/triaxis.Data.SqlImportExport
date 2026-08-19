@@ -59,7 +59,7 @@ internal static class HintAb
                 ? new[] { "Id" }.Concat(Enumerable.Range(0, columns).Select(i => $"C{i}"))
                 : Enumerable.Range(0, columns).Select(i => $"C{i}"));
 
-        public async IAsyncEnumerable<object[]> EnumerateDataAsync()
+        public async IAsyncEnumerable<object?[]> EnumerateDataAsync()
         {
             await Task.CompletedTask;
             var epoch = new DateTime(2020, 1, 1);
